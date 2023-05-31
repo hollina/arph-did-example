@@ -1,5 +1,8 @@
 ---
 title: "Antibiotics and mortality"
+format: 
+  html:
+    self-contained: true
 ---
 
 ## Load packages
@@ -7,10 +10,16 @@ title: "Antibiotics and mortality"
 ```{r, echo = FALSE}
 # Load packages
 if (!require("pacman")) install.packages("pacman")
-pacman::p_load(data.table, ggplot2, haven, fixest, collapse)
+pacman::p_load(data.table, ggplot2, haven, fixest, collapse, tidyverse, broom, lazyeval, bacondecomp, did)
+
+## Clear memory
+rm(list=ls())
 
 # Set seed 
-set.seed(12345)
+set.seed(1234)
+
+# Disable scientific notation
+options(scipen=999)
 ```
 
 ## Load AEJ-Applied data
@@ -20,6 +29,7 @@ Let's start by loading in the simplest data.
 ```{r}
 state_mortality = haven::read_dta("data/raw/113743-V1/AEJApp-20080229_Datasets/20080229_state_data.dta")
 state_mortality = as.data.table(state_mortality)
+#state_mortality[,infl_pneumonia_rate:= infl_pneumonia_rate*3]
 
 
 national_mortality = haven::read_dta("data/raw/113743-V1/AEJApp-20080229_Datasets/20080229_national_data.dta")
@@ -31,7 +41,7 @@ national_mortality[,two:=2]
 Quick look at the data
 
 ```{r}
-flu_plot = ggplot(data = national_mortality, aes(x = year, y = log(influenza_pneumonia_total), shape = as.factor(one))) + 
+flu_plot = ggplot(data = subset(national_mortality, year >= 1928), aes(x = year, y = (influenza_pneumonia_total), shape = as.factor(one))) + 
     geom_point(size = 3, alpha = .75) + 
     theme_classic(base_size = 14) +
     geom_vline(xintercept = 1937, linetype="dashed") +
@@ -44,9 +54,9 @@ flu_plot = ggplot(data = national_mortality, aes(x = year, y = log(influenza_pne
 flu_plot
 ```
 
-```{r}
+```{r, eval = FALSE}
 flu_plot +
-    geom_point(data = national_mortality, aes(x = year, y = log(tuberculosis_total), shape = as.factor(two)), size = 3, alpha = .75) +
+    geom_point(data = national_mortality, aes(x = year, y = (tuberculosis_total), shape = as.factor(two)), size = 3, alpha = .75) +
         theme_classic(base_size = 14) +
     labs(title = "Mortality rate across time", 
          y = "", 
@@ -61,122 +71,772 @@ flu_plot +
 
 Reshape the data, call treatment 1937 and after, create post $\times$ treat variable.
 
-```{r}
+```{r, echo = FALSE}
 state_mortality_reshape = melt(state_mortality, id.vars = c("state_pc", "year"),
                 measure.vars = c("tb_rate", "infl_pneumonia_rate"))
 
 state_mortality_reshape[, treated_disease := ifelse(variable == "tb_rate", 0, 1)]
 state_mortality_reshape[, treated_time := ifelse(year >= 1937, 1, 0)]
 state_mortality_reshape[, treated := treated_time*treated_disease]
+
 ```
 
-Run simple DiD, and show coef.
+Run simple DiD
 
-```{r}
+```{r, echo = FALSE}
 simple_did = fixest::feols(log(value)  ~ treated | treated_disease + state_pc + year, 
               data = state_mortality_reshape)
-etable(simple_did)
+etable(simple_did, tex = TRUE)
 
-simple_did$coeftable[1,1]
 ```
 
-## Create fake treatment groups.
+Show the results
+
+```{r}
+etable(simple_did)
+
+effect = 1*simple_did$coeftable[1,1]*mean(state_mortality$infl_pneumonia_rate, na.rm = TRUE)
+
+```
+
+# Create fake data
 
 Add random variable to each state to get fake treated_year
 
+First create percentiles
+
 ```{r}
-percentiles_flu = state_mortality[ year == 1928,lapply(.SD, quantile, prob = c(.33, .66), na.rm = TRUE),  .SDcols = grep("infl_pneumonia_rate", names(state_mortality), value = TRUE)]
+quantiles = state_mortality[year == 1928, .(untreated = quantile(infl_pneumonia_rate, 0.25, na.rm = TRUE), low = quantile(infl_pneumonia_rate, 0.5, na.rm = TRUE), high = quantile(infl_pneumonia_rate, 0.75, na.rm = TRUE))]
 
-low = unlist(percentiles_flu[1])
-high = unlist(percentiles_flu[2])
-
-state_mortality[, fake_year_treated := ifelse(infl_pneumonia_rate < low & year == 1928, 1930, ifelse(infl_pneumonia_rate > high & year == 1928, 1945, 1940)),  by = state_pc]
-
-state_mortality[ , c("fake_year_treated") := state_mortality[!duplicated(state_pc)][.SD, on = .(fake_year_treated), .(x), roll = Inf]]
-
-state_mortality[, fake_year_treated := ifelse(infl_pneumonia_rate < percentiles_flu[1] & year == 1928, 1930, ifelse(infl_pneumonia_rate > percentiles_flu[2] & year == 1928, 1945, 1940)), by = state_pc]
-
-
-state_mortality[, rand:=runif(1, 0, 1), by = state_pc]
-state_mortality[, fake_year_treated := ifelse(rand < .33, 1930, ifelse(rand > .66, 1940, 1937)), by = state_pc]
-state_mortality[, year_before_1937 := ifelse(year < 1937, year, 0)]
-state_mortality[, year_after_1937 := ifelse(year >= 1937, year, 0)]
 ```
 
-Now for states that are fake treated not in 1937, we need fake data.
+Use these percentiles to create cutoffs in fake treatment.
 
-Get pre-treatment trend and s.d. from the flu trend
+-   Lowest 25% is "never treated"
+
+-   25-50% is early
+
+-   50-75% is middle
+
+-   75%+ is late
+
+```{r}
+
+state_mortality[year == 1928, fake_year_treated := ifelse(infl_pneumonia_rate <= quantiles$untreated, 2020, ifelse(infl_pneumonia_rate > quantiles$untreated & infl_pneumonia_rate <= quantiles$low, 1945,
+                                     ifelse(infl_pneumonia_rate > quantiles$low & infl_pneumonia_rate <= quantiles$high, 1940, 1930)))]
+
+state_mortality = state_mortality[, fake_year_treated := fake_year_treated[year == 1928], by = state_pc]
+
+```
+
+For the fake data, we will use real pre-1930 trends.
+
+Get pre-treatment trend and s.d.
 
 ```{r}
 state_trend_inf = fixest::feols(log(infl_pneumonia_rate)  ~ year | 1, 
               data = subset(state_mortality, year < 1937 & year > 1927))
 etable(state_trend_inf)
-coef_inf = state_trend_inf$coeftable[2,1]
+coef_inf = -state_trend_inf$coeftable[2,1]*mean(state_mortality$infl_pneumonia_rate, na.rm = TRUE)/3
+#coef_inf = 0
 se_inf = state_trend_inf$coeftable[2,2]
 ```
 
+# Create fake data
+
+## Staggered adoption and growing treatment effect.
+
 ```{r}
-state_trend_tb = fixest::feols(log(tb_rate)  ~ year | 1, 
-              data = subset(state_mortality, year < 1937 & year > 1927))
-etable(state_trend_tb)
-coef_tb = state_trend_tb$coeftable[2,1]
-se_tb = state_trend_tb$coeftable[2,2]
+# Keep only the variables that we need from 1928
+timing_yes_growing_yes = state_mortality[year == 1928,.(state_pc, infl_pneumonia_rate, fake_year_treated, pop3)]
+
+# Expand the dataset to be from 1928 until 1950
+full_state_year_grid = data.table(expand.grid(year=1928:1950, state_pc =unique(timing_yes_growing_yes$state_pc)))
+
+scale = 15
+# Create error
+full_state_year_grid[,rand_e:=1-rlnorm(.N, 0.00091/scale, 0.0004346585/scale)]
+full_state_year_grid[year == 1928, rand_st:=1-rlnorm(.N, 0.00091/scale, 0.0004346585/scale)]
+full_state_year_grid[state_pc == "AL", rand_yr:=1-rlnorm(.N, 0.00091/scale, 0.0004346585/scale)]
+
+#full_state_year_grid[,rand_e:=0]
+#full_state_year_grid[year == 1928, rand_st:=0]
+#full_state_year_grid[state_pc == "AL", rand_yr:=0]
+
+full_state_year_grid = full_state_year_grid[, rand_st := rand_st[year == 1928], by = state_pc]
+full_state_year_grid = full_state_year_grid[, rand_yr := rand_yr[state_pc == "AL"], by = year]
+
+# Merge the two togethers
+timing_yes_growing_yes = merge(timing_yes_growing_yes, full_state_year_grid, by = "state_pc")
+
+# Add fake treatment status in each year
+timing_yes_growing_yes[, treated := ifelse(year >= fake_year_treated, 1, 0)]
+
+# Add "natural" slope from pre-trend
+timing_yes_growing_yes[, fake_value := (infl_pneumonia_rate - (year-1928)*coef_inf) + .1*rand_st + .05*rand_yr + .1*rand_e]
+
+# Add treatment effect
+timing_yes_growing_yes[, fake_value := ifelse(fake_year_treated == 1940, fake_value + effect*treated + (.0005*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated), ifelse(fake_year_treated == 1945, fake_value + effect*treated + (.0002*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated),fake_value + effect*treated + (.0015*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated)))]
+
+# Bound at zero
+timing_yes_growing_yes[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
+
+# Collapse into timing groups
+timing_yes_growing_yes_collapsed = collap(timing_yes_growing_yes, ~ year + fake_year_treated, fmean, cols = 10, w = timing_yes_growing_yes$pop3)
 ```
 
-Create state-specific trend that
+## Staggered adoption and stable treatment effect.
 
 ```{r}
-temp = subset(state_mortality, year == 1928)
-temp = temp[,.(state_pc, infl_pneumonia_rate, tb_rate, fake_year_treated)]
-temp2 = data.table(expand.grid(year=1928:1950, state_pc =unique(temp$state_pc)))
-temp3 = merge(temp, temp2, by = "state_pc")
-fake_data = melt(temp3, id.vars = c("state_pc", "year", "fake_year_treated"),
-                measure.vars = c("tb_rate", "infl_pneumonia_rate"))
+# Keep only the variables that we need from 1928
+timing_yes_growing_no = state_mortality[year == 1928,.(state_pc, infl_pneumonia_rate, fake_year_treated, pop3)]
 
-fake_data[, treated_disease := ifelse(variable == "tb_rate", 0, 1)]
-fake_data[, treated_time := ifelse(year >= fake_year_treated, 1, 0)]
-fake_data[, treated := treated_time*treated_disease]
+# Merge the two togethers
+timing_yes_growing_no = merge(timing_yes_growing_no, full_state_year_grid, by = "state_pc")
 
+# Add fake treatment status in each year
+timing_yes_growing_no[, treated := ifelse(year >= fake_year_treated, 1, 0)]
 
-fake_data[, fake_value := ifelse(variable == "tb_rate", (value)*(1 + (year-1928)*coef_tb), (value)*(1 + (year-1928)*coef_inf))]
+# Add "natural" slope from pre-trend
+timing_yes_growing_no[, fake_value := (infl_pneumonia_rate - (year-1928)*coef_inf) + .1*rand_st + .05*rand_yr + .1*rand_e]
 
-fake_data[, fake_value := ifelse(treated == 1, fake_value*(1 + simple_did$coeftable[1,1]), fake_value)]
+# Add treatment effect
+timing_yes_growing_no[, fake_value := fake_value + effect*treated]
 
-fake_data[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
+# Bound at zero
+timing_yes_growing_no[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
 
+# Collapse into timing groups
+timing_yes_growing_no_collapsed = collap(timing_yes_growing_no, ~ year + fake_year_treated, fmean, cols = 10, w = timing_yes_growing_yes$pop3)
 ```
 
-Collapse data to timing group
+## Same adoption and growing treatment effect.
 
 ```{r}
+# Keep only the variables that we need from 1928
+timing_no_growing_yes = state_mortality[year == 1928,.(state_pc, infl_pneumonia_rate, fake_year_treated, pop3)]
 
-collapsed_fake_data = collap(fake_data, ~ treated_disease + year + fake_year_treated, fmean, cols = 9)
+# Replace fake treatment status for ever treated years
+timing_no_growing_yes[, fake_year_treated := ifelse(fake_year_treated < 1950, 1937, fake_year_treated)]
 
+# Merge the two togethers
+timing_no_growing_yes = merge(timing_no_growing_yes, full_state_year_grid, by = "state_pc")
+
+# Add fake treatment status in each year
+timing_no_growing_yes[, treated := ifelse(year >= fake_year_treated, 1, 0)]
+
+# Add "natural" slope from pre-trend
+timing_no_growing_yes[, fake_value := (infl_pneumonia_rate - (year-1928)*coef_inf) + .1*rand_st + .05*rand_yr + .1*rand_e]
+
+# Add treatment effect
+timing_no_growing_yes[, fake_value := ifelse(fake_year_treated == 1940, fake_value + effect*treated + (.0005*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated), ifelse(fake_year_treated == 1945, fake_value + effect*treated + (.0002*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated),fake_value + effect*treated + (.0015*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated)))]
+
+# Bound at zero
+timing_no_growing_yes[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
+
+# Collapse into timing groups
+timing_no_growing_yes_collapsed = collap(timing_no_growing_yes, ~ year + fake_year_treated, fmean, cols = 10, w = timing_yes_growing_yes$pop3)
 ```
 
+## Same adoption and stable treatment effect.
+
 ```{r}
-flu_plot_fake = ggplot(data = subset(collapsed_fake_data, treated_disease == 1), aes(x = year, y = log(fake_value), shape = as.factor(fake_year_treated))) + 
-    geom_point(size = 3, alpha = .4) + 
+# Keep only the variables that we need from 1928
+timing_no_growing_no = state_mortality[year == 1928,.(state_pc, infl_pneumonia_rate, fake_year_treated, pop3)]
+
+# Replace fake treatment status for ever treated years
+timing_no_growing_no[, fake_year_treated := ifelse(fake_year_treated < 1950, 1937, fake_year_treated)]
+
+# Merge the two togethers
+timing_no_growing_no = merge(timing_no_growing_no, full_state_year_grid, by = "state_pc")
+
+# Add fake treatment status in each year
+timing_no_growing_no[, treated := ifelse(year >= fake_year_treated, 1, 0)]
+
+# Add "natural" slope from pre-trend
+timing_no_growing_no[, fake_value := (infl_pneumonia_rate - (year-1928)*coef_inf) + .1*rand_st + .05*rand_yr + .1*rand_e]
+
+# Add treatment effect
+timing_no_growing_no[, fake_value := fake_value + effect*treated]
+
+# Bound at zero
+timing_no_growing_no[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
+
+# Collapse into timing groups
+timing_no_growing_no_collapsed = collap(timing_no_growing_no, ~ year + fake_year_treated, fmean, cols = 10, w = timing_yes_growing_yes$pop3)
+```
+
+
+## Plot each group.
+
+### Staggered adoption and dynamic treatment effect.
+
+```{r}
+timing_yes_growing_yes_plot = ggplot(data = timing_yes_growing_yes_collapsed,
+                                    aes(x = year, y = (fake_value)*100000, shape = as.factor(fake_year_treated))) + 
+    geom_point(size = 3, alpha = 1) + 
     theme_classic(base_size = 14) +
-    geom_vline(xintercept = 1936.5, linetype="dashed") +
+    geom_vline(xintercept = 1944.5, linetype="dashed") +
     geom_vline(xintercept = 1929.5, linetype="dashed") +
     geom_vline(xintercept = 1939.5, linetype="dashed") +
-    labs(title = "Influenza and pneumonia mortality rate across time", 
+    labs(title = "Fake treatment, staggered adoption, growing treatment", 
          y = "", 
-         subtitle = "Death rate per 100,000",
+         subtitle = "Influenza/pneumonia mortality death rate per 100,000",
          x = "Year") +
-    theme(legend.position = "none") 
-
-flu_plot_fake
+      scale_shape_manual(name = "", 
+                         values=c(15, 16, 17, 4), 
+                         labels = c("Early", 
+                                    "Middle", 
+                                    "Late", 
+                                    "Never"),  
+                         guide = 'legend') + 
+  theme(legend.position = c(.9, .9))
+timing_yes_growing_yes_plot
 ```
 
-# run event study regression
+### Staggered adoption and stable treatment effect.
+
+```{r}
+timing_yes_growing_no_plot = ggplot(data = timing_yes_growing_no_collapsed,
+                                    aes(x = year, y = (fake_value)*100000, shape = as.factor(fake_year_treated))) + 
+    geom_point(size = 3, alpha = 1) + 
+    theme_classic(base_size = 14) +
+    geom_vline(xintercept = 1944.5, linetype="dashed") +
+    geom_vline(xintercept = 1929.5, linetype="dashed") +
+    geom_vline(xintercept = 1939.5, linetype="dashed") +
+    labs(title = "Fake treatment, staggered adoption, stable treatment", 
+         y = "", 
+         subtitle = "Influenza/pneumonia mortality death rate per 100,000",
+         x = "Year") +
+      scale_shape_manual(name = "", 
+                         values=c(15, 16, 17, 4), 
+                         labels = c("Early", 
+                                    "Middle", 
+                                    "Late", 
+                                    "Never"),  
+                         guide = 'legend') + 
+  theme(legend.position = c(.9, .9))
+timing_yes_growing_no_plot
+```
+
+### Same adoption and dynamic treatment effect.
+
+```{r}
+timing_no_growing_yes_plot = ggplot(data = timing_no_growing_yes_collapsed,
+                                    aes(x = year, y = (fake_value)*100000, shape = as.factor(fake_year_treated))) + 
+    geom_point(size = 3, alpha = 1) + 
+    theme_classic(base_size = 14) +
+    geom_vline(xintercept = 1936.5, linetype="dashed") +
+    labs(title = "Fake treatment, non-staggered adoption, growing treatment", 
+         y = "", 
+         subtitle = "Influenza/pneumonia mortality death rate per 100,000",
+         x = "Year") +
+      scale_shape_manual(name = "", 
+                         values=c(15, 4), 
+                         labels = c("1937", 
+                                    "Never"),  
+                         guide = 'legend') + 
+  theme(legend.position = c(.9, .9))
+timing_no_growing_yes_plot
+```
+
+### Same adoption and stable treatment effect.
+
+```{r}
+timing_no_growing_no_plot = ggplot(data = timing_no_growing_no_collapsed,
+                                    aes(x = year, y = (fake_value)*100000, shape = as.factor(fake_year_treated))) + 
+    geom_point(size = 3, alpha = 1) + 
+    theme_classic(base_size = 14) +
+    geom_vline(xintercept = 1936.5, linetype="dashed") +
+    labs(title = "Fake treatment, non-staggered adoption, stable treatment", 
+         y = "", 
+         subtitle = "Influenza/pneumonia mortality death rate per 100,000",
+         x = "Year") +
+      scale_shape_manual(name = "", 
+                         values=c(15, 4), 
+                         labels = c("1937", 
+                                    "Never"),  
+                         guide = 'legend') + 
+  theme(legend.position = c(.9, .9))
+timing_no_growing_no_plot
+```
+
+## Run naive twoway FE regressions
+
+### Staggered adoption and dynamic treatment effect.
+
+```{r}
+timing_yes_growing_yes_did = fixest::feols((fake_value)*100000 ~ treated | state_pc + year, data = timing_yes_growing_yes)
+
+# Estimate of the treatment effect is 
+timing_yes_growing_yes_did$coeftable[1,1]
+
+# Real treatment effect is initial 
+print(effect)
+
+# Then grows by this each year. 
+print(simple_did$coeftable[1,1])
+```
+### Staggered adoption and stable treatment effect.
+```{r}
+timing_yes_growing_no_did = fixest::feols((fake_value)*100000 ~ treated | state_pc + year, data = timing_yes_growing_no)
+
+# Estimate of the treatment effect is 
+timing_yes_growing_no_did$coeftable[1,1]
+
+# Real treatment effect is initial 
+print(effect)
+
+# Then grows by this each year. 
+print(0)
+```
+
+### Same adoption and dynamic treatment effect.
+```{r}
+timing_no_growing_yes_did = fixest::feols((fake_value)*100000 ~ treated | state_pc + year, data = timing_no_growing_yes)
+
+# Estimate of the treatment effect is 
+timing_no_growing_yes_did$coeftable[1,1]
+
+# Real treatment effect is 
+print(effect)
+
+# Then grows by this each year. 
+print(simple_did$coeftable[1,1])
+```
+### Same adoption and stable treatment effect.
+
+```{r}
+timing_no_growing_no_did = fixest::feols((fake_value)*100000 ~ treated | state_pc + year, data = timing_no_growing_no)
+
+# Estimate of the treatment effect is 
+timing_no_growing_no_did$coeftable[1,1]
+
+# Real treatment effect is 
+print(effect)
+
+# Then grows by this each year. 
+print(0)
+```
+
+### Table showing results
+```{r}
+etable(timing_no_growing_no_did, timing_no_growing_yes_did, timing_yes_growing_no_did, timing_yes_growing_yes_did)
+```
+
+## Run naive twoway FE event-studies
+
+Create event study data. 
+
+
+
+### Same adoption and stable treatment effect.
+
+```{r}
+high_cap = 
+low_cap = -8
+#state_pc, year, high_cap, low_cap, timing_no_growing_no
+# id, time, high_cap, low_cap, dataset
+```
+
+```{r}
+# Create a temporary dataset that creates "event-time" and caps this variable. 
+    # Never treated units get set to -1
+temp = timing_yes_growing_yes[treated == 1, .SD[which.min(year)], by = state_pc][,first_time := year][,.(state_pc, first_time)]
+
+temp = merge(temp, timing_yes_growing_yes, all.y = TRUE)
+
+temp[, event_time := year - first_time][,event_time_capped := ifelse(event_time > high_cap,  high_cap + 1, ifelse( event_time < low_cap,  low_cap - 1, event_time))][,event_time_capped := ifelse(is.na(event_time), -1, event_time_capped)]
+
+# Create a list of unique levels of the capped event-time variable
+unique_vals = levels(as.factor(temp$event_time_capped))
+    
+# Remove -1 event-time (so it will be forced to be reference group)
+unique_vals = unique_vals[!(unique_vals == -1)]
+
+
+# Create a dummy variable matrix. 
+    # Note this is strictly binary 
+        # You could imagine wanting NA values 
+        # (e.g., can you know if T-5 is really zero or one if the current year is 2020 and the data year is 2019?)
+            # Technically this should be NA IMO. 
+    # Fill in the 1's
+    for (i in unique_vals) {
+        temp[event_time_capped == i, paste0('_T', i) := 1]
+    }
+    # Fill in the zeros
+    for (i in seq(ncol(temp)-length(unique_vals)+1,ncol(temp))) set(temp, i=which(is.na(temp[[i]])), j=i, value=0)
+      
+timing_yes_growing_yes_es_data = temp
+```
+
+
+
+### Staggered adoption and stable treatment effect.
+
+```{r}
+high_cap = 8
+low_cap = -8
+#state_pc, year, high_cap, low_cap, timing_no_growing_no
+# id, time, high_cap, low_cap, dataset
+```
+
+```{r}
+# Create a temporary dataset that creates "event-time" and caps this variable. 
+    # Never treated units get set to -1
+temp = timing_yes_growing_no[treated == 1, .SD[which.min(year)], by = state_pc][,first_time := year][,.(state_pc, first_time)]
+
+temp = merge(temp, timing_yes_growing_no, all.y = TRUE)
+
+temp[, event_time := year - first_time][,event_time_capped := ifelse(event_time > high_cap,  high_cap + 1, ifelse( event_time < low_cap,  low_cap - 1, event_time))][,event_time_capped := ifelse(is.na(event_time), -1, event_time_capped)]
+
+# Create a list of unique levels of the capped event-time variable
+unique_vals = levels(as.factor(temp$event_time_capped))
+    
+# Remove -1 event-time (so it will be forced to be reference group)
+unique_vals = unique_vals[!(unique_vals == -1)]
+
+
+# Create a dummy variable matrix. 
+    # Note this is strictly binary 
+        # You could imagine wanting NA values 
+        # (e.g., can you know if T-5 is really zero or one if the current year is 2020 and the data year is 2019?)
+            # Technically this should be NA IMO. 
+    # Fill in the 1's
+    for (i in unique_vals) {
+        temp[event_time_capped == i, paste0('_T', i) := 1]
+    }
+    # Fill in the zeros
+    for (i in seq(ncol(temp)-length(unique_vals)+1,ncol(temp))) set(temp, i=which(is.na(temp[[i]])), j=i, value=0)
+      
+timing_yes_growing_no_es_data = temp
+```
+
+
+### Same adoption and growing treatment effect.
+
+```{r}
+high_cap = 8
+low_cap = -8
+#state_pc, year, high_cap, low_cap, timing_no_growing_no
+# id, time, high_cap, low_cap, dataset
+```
+```{r}
+# Create a temporary dataset that creates "event-time" and caps this variable. 
+    # Never treated units get set to -1
+temp = timing_no_growing_yes[treated == 1, .SD[which.min(year)], by = state_pc][,first_time := year][,.(state_pc, first_time)]
+
+temp = merge(temp, timing_no_growing_yes, all.y = TRUE)
+
+temp[, event_time := year - first_time][,event_time_capped := ifelse(event_time > high_cap,  high_cap + 1, ifelse( event_time < low_cap,  low_cap - 1, event_time))][,event_time_capped := ifelse(is.na(event_time), -1, event_time_capped)]
+
+# Create a list of unique levels of the capped event-time variable
+unique_vals = levels(as.factor(temp$event_time_capped))
+    
+# Remove -1 event-time (so it will be forced to be reference group)
+unique_vals = unique_vals[!(unique_vals == -1)]
+
+
+# Create a dummy variable matrix. 
+    # Note this is strictly binary 
+        # You could imagine wanting NA values 
+        # (e.g., can you know if T-5 is really zero or one if the current year is 2020 and the data year is 2019?)
+            # Technically this should be NA IMO. 
+    # Fill in the 1's
+    for (i in unique_vals) {
+        temp[event_time_capped == i, paste0('_T', i) := 1]
+    }
+    # Fill in the zeros
+    for (i in seq(ncol(temp)-length(unique_vals)+1,ncol(temp))) set(temp, i=which(is.na(temp[[i]])), j=i, value=0)
+      
+timing_no_growing_yes_es_data = temp
+```
+
+
+### Same adoption and stable treatment effect.
+```{r}
+high_cap = 8
+low_cap = -8
+#state_pc, year, high_cap, low_cap, timing_no_growing_no
+# id, time, high_cap, low_cap, dataset
+```
+
+```{r}
+# Create a temporary dataset that creates "event-time" and caps this variable. 
+    # Never treated units get set to -1
+temp = timing_no_growing_no[treated == 1, .SD[which.min(year)], by = state_pc][,first_time := year][,.(state_pc, first_time)]
+
+temp = merge(temp, timing_no_growing_no, all.y = TRUE)
+
+temp[, event_time := year - first_time][,event_time_capped := ifelse(event_time > high_cap,  high_cap + 1, ifelse( event_time < low_cap,  low_cap - 1, event_time))][,event_time_capped := ifelse(is.na(event_time), -1, event_time_capped)]
+
+# Create a list of unique levels of the capped event-time variable
+unique_vals = levels(as.factor(temp$event_time_capped))
+    
+# Remove -1 event-time (so it will be forced to be reference group)
+unique_vals = unique_vals[!(unique_vals == -1)]
+
+
+# Create a dummy variable matrix. 
+    # Note this is strictly binary 
+        # You could imagine wanting NA values 
+        # (e.g., can you know if T-5 is really zero or one if the current year is 2020 and the data year is 2019?)
+            # Technically this should be NA IMO. 
+    # Fill in the 1's
+    for (i in unique_vals) {
+        temp[event_time_capped == i, paste0('_T', i) := 1]
+    }
+    # Fill in the zeros
+    for (i in seq(ncol(temp)-length(unique_vals)+1,ncol(temp))) set(temp, i=which(is.na(temp[[i]])), j=i, value=0)
+      
+timing_no_growing_no_es_data = temp
+```
+
+```{r, echo = FALSE}
+# Load event study functions
+source("event-study-functions.R")
+```
+
+## Run the event studies
+
+```{r}
+timing_yes_growing_yes_es_results = event_study_regression(dataset = timing_yes_growing_yes_es_data,
+               id = state_pc,
+               time = year,
+               treated = "treated",
+               y_var = "(fake_value)*100000",
+               dd_control_list = NULL,
+               control_list = NULL,
+               fixed_effects = "state_pc + year",
+               cluster_var = state_pc, 
+               low_cap = -8,
+               high_cap = 8)
+
+timing_yes_growing_no_es_results = event_study_regression(dataset = timing_yes_growing_no_es_data,
+               id = state_pc,
+               time = year,
+               treated = "treated",
+               y_var = "(fake_value)*100000",
+               dd_control_list = NULL,
+               control_list = NULL,
+               fixed_effects = "state_pc + year",
+               cluster_var = state_pc, 
+               low_cap = -8,
+               high_cap = 8)
+
+timing_no_growing_yes_es_results = event_study_regression(dataset = timing_no_growing_yes_es_data,
+               id = state_pc,
+               time = year,
+               treated = "treated",
+               y_var = "(fake_value)*100000",
+               dd_control_list = NULL,
+               control_list = NULL,
+               fixed_effects = "state_pc + year",
+               cluster_var = state_pc, 
+               low_cap = -8,
+               high_cap = 8)
+
+
+timing_no_growing_no_es_results = event_study_regression(dataset = timing_no_growing_no_es_data,
+               id = state_pc,
+               time = year,
+               treated = "treated",
+               y_var = "(fake_value)*100000",
+               dd_control_list = NULL,
+               control_list = NULL,
+               fixed_effects = "state_pc + year",
+               cluster_var = state_pc, 
+               low_cap = -8,
+               high_cap = 8)
+
+```
+
+## Plot naive event studies
+```{r}
+timing_yes_growing_yes_es_plot = plot_event_study(event_study_results = timing_yes_growing_yes_es_results,
+                                     low_cap = -9,
+                                     high_cap = 9,
+                                     breaks = 1, 
+                                     plot_title = "Yes timing, Yes growth", 
+                                     x_title = "Years since sulfa discovery", 
+                                     plot_subtitle = "Percent change in death rate")
+timing_yes_growing_yes_es_plot
+```
+
+```{r}
+timing_yes_growing_no_es_plot = plot_event_study(event_study_results = timing_yes_growing_no_es_results,
+                                     low_cap = -8,
+                                     high_cap = 8,
+                                     breaks = 1, 
+                                     plot_title = "Yes timing, No growth", 
+                                     x_title = "Years since sulfa discovery", 
+                                     plot_subtitle = "Percent change in death rate")
+timing_yes_growing_no_es_plot
+```
+
+```{r}
+timing_no_growing_yes_es_plot = plot_event_study(event_study_results = timing_no_growing_yes_es_results,
+                                     low_cap = -8,
+                                     high_cap = 8,
+                                     breaks = 1, 
+                                     plot_title = "No timing, Yes growth", 
+                                     x_title = "Years since sulfa discovery", 
+                                     plot_subtitle = "Percent change in death rate")
+timing_no_growing_yes_es_plot
+```
+
+```{r}
+timing_no_growing_no_es_plot = plot_event_study(event_study_results = timing_no_growing_no_es_results,
+                                     low_cap = -8,
+                                     high_cap = 8,
+                                     breaks = 1, 
+                                     plot_title = "No timing, no growth", 
+                                     x_title = "Years since sulfa discovery", 
+                                     plot_subtitle = "Percent change in death rate")
+
+timing_no_growing_no_es_plot
+```
+
+# Bacon decomp
+
+### Staggered adoption and growing treatment effect.
+
+```{r}
+timing_yes_growing_yes[,ln_fake_value := (fake_value)*100000]
+
+timing_yes_growing_yes_bacon = bacon(ln_fake_value ~ treated,
+                  data = as.data.frame(timing_yes_growing_yes),
+                  id_var = "state_pc",
+                  time_var = "year")
+# weighted average of the decomposition
+sum(timing_yes_growing_yes_bacon$estimate * timing_yes_growing_yes_bacon$weight)
+
+
+ggplot(timing_yes_growing_yes_bacon) +
+  aes(x = weight, y = estimate, shape = factor(type)) +
+  geom_point() +
+  geom_hline(yintercept = 0) + 
+  theme_minimal() +
+  labs(x = "Weight", y = "Estimate", shape = "Type")
+```    
+### Staggered adoption and stable treatment effect.
+
+```{r}
+timing_yes_growing_no[,ln_fake_value := (fake_value)*100000]
+
+timing_yes_growing_no_bacon = bacon(ln_fake_value ~ treated,
+                  data = as.data.frame(timing_yes_growing_no),
+                  id_var = "state_pc",
+                  time_var = "year")
+
+ggplot(timing_yes_growing_no_bacon) +
+  aes(x = weight, y = estimate, shape = factor(type)) +
+  geom_point() +
+  geom_hline(yintercept = 0) + 
+  theme_minimal() +
+  labs(x = "Weight", y = "Estimate", shape = "Type")
+```                  
+### Same adoption and growing treatment effect.
+
+```{r}
+timing_no_growing_yes[,ln_fake_value := (fake_value)*100000]
+
+timing_no_growing_yes_bacon = bacon(ln_fake_value ~ treated,
+                  data = as.data.frame(timing_no_growing_yes),
+                  id_var = "state_pc",
+                  time_var = "year")
+
+ggplot(timing_no_growing_yes_bacon) +
+  aes(x = weight, y = estimate, shape = factor(type)) +
+  geom_point() +
+  geom_hline(yintercept = 0) + 
+  theme_minimal() +
+  labs(x = "Weight", y = "Estimate", shape = "Type")
+```    
+### Same adoption and stable treatment effect.
+
+```{r}
+timing_no_growing_no[,ln_fake_value := (fake_value)*100000]
+
+timing_no_growing_no_bacon = bacon(ln_fake_value ~ treated,
+                  data = as.data.frame(timing_no_growing_no),
+                  id_var = "state_pc",
+                  time_var = "year")
+
+ggplot(timing_no_growing_no_bacon) +
+  aes(x = weight, y = estimate, shape = factor(type)) +
+  geom_point() +
+  geom_hline(yintercept = 0) + 
+  theme_minimal() +
+  labs(x = "Weight", y = "Estimate", shape = "Type")
+
+
+```   
+
+```{r}
+timing_yes_growing_yes_feols = timing_yes_growing_yes
+
+
+
+timing_yes_growing_yes_feols[, event_time := year - fake_year_treated]
+
+timing_yes_growing_yes_feols[, event_time := ifelse(fake_year_treated == 2020, -1, event_time)]
+
+mod_twfe = feols(fake_value*100000 ~ i(event_time, ref = -1)  ## Our key interaction: time × treatment status
+          |                    ## Other controls
+          state_pc + year,                             ## FEs
+         cluster = ~state_pc,                          ## Clustered SEs
+         data = timing_yes_growing_yes_feols)
+
+iplot(mod_twfe, 
+      xlab = 'Time to treatment',
+      main = 'Event study: Staggered treatment (TWFE)')
+```
+
+```{r}
+mod_sa = feols(fake_value*100000 ~ sunab(fake_year_treated, year)  ## Our key interaction: time × treatment status
+		  |                    ## Other controls
+		  state_pc + year,                             ## FEs
+		 cluster = ~state_pc,                          ## Clustered SEs
+		 data = timing_yes_growing_yes_es_data)
+summary(mod_sa, agg = "ATT")
+```
+
+```{r}
+iplot(list(mod_twfe, mod_sa), sep = 0.5, ref.line = -1,
+      xlab = 'Time to treatment',
+      main = 'Event study: Staggered treatment')
+legend("bottomleft", col = c(1, 2), pch = c(20, 17), 
+       legend = c("TWFE", "Sun & Abraham (2020)"))
+```
+
+
+## CS
 
 ```{r}
 
-state_mortality_reshape[, years_until_treat := ifelse(treated_disease == 0, -1,  1937 - year)]
 
-es_real = fixest::feols(log(value)  ~ i(years_until_treat, ref=-1) | treated_disease + state_pc + year, 
-              data = state_mortality_reshape)
-iplot(es_real, ylim.add=c(-.5,.5))
+timing_yes_growing_yes_cs = timing_yes_growing_yes
+
+timing_yes_growing_yes_cs[,fake_value2 := fake_value*100000]
+timing_yes_growing_yes_cs[,state_group := as.numeric(as.factor(state_pc))]
+timing_yes_growing_yes_cs[,fake_year_treated2 := ifelse(fake_year_treated == 2020, 0, fake_year_treated)]
+
+example_attgt <- att_gt(yname = "fake_value2",
+                        tname = "year",
+                        idname = "state_group",
+                        gname = "fake_year_treated2",
+                        xformla = ~1,
+                        data = timing_yes_growing_yes_cs
+                        )
+summary(example_attgt)
+
+mw.dyn <- aggte(example_attgt, type = "dynamic")
+summary(mw.dyn)
+
+```
+
+```{r}
+es <- aggte(example_attgt, type = "dynamic")
+ggdid(es)
 ```
