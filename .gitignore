@@ -337,3 +337,4 @@ temp_local/iv_data_for_carbonate.dta
 latex/hollingsworth-duke-endowment-slides-osu-aede.tex
 
 /.quarto/
+.DS_Store

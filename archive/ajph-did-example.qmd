@@ -10,7 +10,7 @@ format:
 ```{r, echo = FALSE}
 # Load packages
 if (!require("pacman")) install.packages("pacman")
-pacman::p_load(data.table, ggplot2, haven, fixest, collapse, tidyverse, broom, lazyeval, bacondecomp, did)
+pacman::p_load(data.table, ggplot2, haven, fixest, collapse, tidyverse, broom, lazyeval, bacondecomp, did, ggiplot)
 
 ## Clear memory
 rm(list=ls())
@@ -176,7 +176,7 @@ timing_yes_growing_yes[, treated := ifelse(year >= fake_year_treated, 1, 0)]
 timing_yes_growing_yes[, fake_value := (infl_pneumonia_rate - (year-1928)*coef_inf) + .1*rand_st + .05*rand_yr + .1*rand_e]
 
 # Add treatment effect
-timing_yes_growing_yes[, fake_value := ifelse(fake_year_treated == 1940, fake_value + effect*treated + (.0005*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated), ifelse(fake_year_treated == 1945, fake_value + effect*treated + (.0002*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated),fake_value + effect*treated + (.0015*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated)))]
+timing_yes_growing_yes[, fake_value := ifelse(fake_year_treated == 1940, fake_value + effect*treated + (.0005*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated), ifelse(fake_year_treated == 1945, fake_value + effect*treated + (.0002*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated),fake_value + effect*treated + (.0025*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated)))]
 
 # Bound at zero
 timing_yes_growing_yes[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
@@ -229,7 +229,7 @@ timing_no_growing_yes[, treated := ifelse(year >= fake_year_treated, 1, 0)]
 timing_no_growing_yes[, fake_value := (infl_pneumonia_rate - (year-1928)*coef_inf) + .1*rand_st + .05*rand_yr + .1*rand_e]
 
 # Add treatment effect
-timing_no_growing_yes[, fake_value := ifelse(fake_year_treated == 1940, fake_value + effect*treated + (.0005*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated), ifelse(fake_year_treated == 1945, fake_value + effect*treated + (.0002*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated),fake_value + effect*treated + (.0015*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated)))]
+timing_no_growing_yes[, fake_value := ifelse(fake_year_treated == 1940, fake_value + effect*treated + (.0005*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated), ifelse(fake_year_treated == 1945, fake_value + effect*treated + (.0002*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated),fake_value + effect*treated + (.0025*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated)))]
 
 # Bound at zero
 timing_no_growing_yes[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
@@ -265,7 +265,6 @@ timing_no_growing_no[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
 # Collapse into timing groups
 timing_no_growing_no_collapsed = collap(timing_no_growing_no, ~ year + fake_year_treated, fmean, cols = 10, w = timing_yes_growing_yes$pop3)
 ```
-
 
 ## Plot each group.
 
@@ -366,6 +365,7 @@ timing_no_growing_no_plot
 ### Staggered adoption and dynamic treatment effect.
 
 ```{r}
+
 timing_yes_growing_yes_did = fixest::feols((fake_value)*100000 ~ treated | state_pc + year, data = timing_yes_growing_yes)
 
 # Estimate of the treatment effect is 
@@ -377,7 +377,120 @@ print(effect)
 # Then grows by this each year. 
 print(simple_did$coeftable[1,1])
 ```
+
+```{r}
+# Now in event time
+timing_yes_growing_yes[, event_time := year - fake_year_treated]
+timing_yes_growing_yes[, event_time := ifelse(fake_year_treated == 2020, -1,  event_time)]
+
+# Add ever treated
+timing_yes_growing_yes[, ever_treated := ifelse(fake_year_treated == 2020, 0,  1)]
+timing_yes_growing_yes[, new_y := (fake_value)*100000]
+
+# Create storage dataset. 
+timing_yes_growing_yes_storage = data.table(event_time = numeric(), b=numeric(), se=numeric(), Method=character())
+
+timing_yes_growing_yes_did = fixest::feols(new_y ~ i(event_time, ever_treated, ref = -1) | state_pc + year, data = timing_yes_growing_yes)
+
+temp = as.data.table(
+        cbind(
+            timing_yes_growing_yes_did$model_matrix_info[[1]]$items, 
+            timing_yes_growing_yes_did$coefficients, 
+            timing_yes_growing_yes_did$se, 
+            rep("TWFE",each=length(timing_yes_growing_yes_did$se))
+            )
+        )
+timing_yes_growing_yes_storage = rbind(timing_yes_growing_yes_storage, temp, 
+                                       use.names = FALSE)
+
+timing_yes_growing_yes_sa = fixest::feols(new_y ~ sunab(fake_year_treated, year) | state_pc + year, data = timing_yes_growing_yes)
+
+temp_coef = timing_yes_growing_yes_sa$coeftable
+
+temp = as.data.table(
+        cbind(
+            timing_yes_growing_yes_sa$model_matrix_info[[1]]$items, 
+            timing_yes_growing_yes_sa$coeftable[,1], 
+            timing_yes_growing_yes_sa$coeftable[,2], 
+            rep("Sun & Abraham (2020)",
+                each=length(timing_yes_growing_yes_sa$coeftable[,2]))
+            )
+        )
+timing_yes_growing_yes_storage = rbind(timing_yes_growing_yes_storage, temp, 
+                                       use.names = FALSE)
+
+
+
+timing_yes_growing_yes_cs = timing_yes_growing_yes
+
+timing_yes_growing_yes_cs[,fake_value2 := fake_value*100000]
+timing_yes_growing_yes_cs[,state_group := as.numeric(as.factor(state_pc))]
+timing_yes_growing_yes_cs[,fake_year_treated2 := ifelse(fake_year_treated == 2020, 0, fake_year_treated)]
+
+example_attgt <- att_gt(yname = "fake_value2",
+                        tname = "year",
+                        idname = "state_group",
+                        gname = "fake_year_treated2",
+                        xformla = ~1,
+                        data = timing_yes_growing_yes_cs
+                        )
+es <- aggte(example_attgt, type = "dynamic")
+
+
+temp = as.data.table(
+        cbind(
+           es$egt, 
+            es$att.egt, 
+            es$se.egt, 
+            rep("Callaway Sant'Anna", each=length(es$egt))
+            )
+        )
+timing_yes_growing_yes_storage = rbind(timing_yes_growing_yes_storage, temp, 
+                                       use.names = FALSE)
+timing_yes_growing_yes_storage[, b := as.numeric(b)]
+timing_yes_growing_yes_storage[, se := as.numeric(se)]
+timing_yes_growing_yes_storage[, event_time := as.numeric(event_time)]
+
+ggplot(data = timing_yes_growing_yes_storage, 
+       aes(x = event_time, 
+           y = b, 
+           ymin = b - 1.96*se, 
+           ymax = b + 1.96*se,
+           shape = Method, 
+           color = Method)) + 
+    geom_point(size=1.5) +
+    geom_errorbar(width=0.1) +
+    theme_minimal() +
+    geom_vline(xintercept = -.5) +
+    geom_hline(yintercept = 0) +
+    labs(title = "Event-study estimates by method", 
+         y = "", 
+         subtitle = "Change in influenza/pneumonia mortality death rate per 100,000", 
+         x = "Years since sulfa available in state") +
+    xlim(-20, 19)
+
+
+
+
+
+
+```
+
+
+```{r}
+timing_yes_growing_yes_did$coeftable
+
+ggiplot(list('TWFE' = timing_yes_growing_yes_did, 'Sun & Abraham (2020)' = timing_yes_growing_yes_sa), 
+        main = 'Staggered treatment: Split multi-sample',
+        geom_style = 'ribbon',
+        ref.line = -.5) +
+  xlim(-8.5, 8.5) +
+    ylim(-75, 25)
+
+```
+
 ### Staggered adoption and stable treatment effect.
+
 ```{r}
 timing_yes_growing_no_did = fixest::feols((fake_value)*100000 ~ treated | state_pc + year, data = timing_yes_growing_no)
 
@@ -392,6 +505,7 @@ print(0)
 ```
 
 ### Same adoption and dynamic treatment effect.
+
 ```{r}
 timing_no_growing_yes_did = fixest::feols((fake_value)*100000 ~ treated | state_pc + year, data = timing_no_growing_yes)
 
@@ -404,6 +518,7 @@ print(effect)
 # Then grows by this each year. 
 print(simple_did$coeftable[1,1])
 ```
+
 ### Same adoption and stable treatment effect.
 
 ```{r}
@@ -420,15 +535,14 @@ print(0)
 ```
 
 ### Table showing results
+
 ```{r}
 etable(timing_no_growing_no_did, timing_no_growing_yes_did, timing_yes_growing_no_did, timing_yes_growing_yes_did)
 ```
 
 ## Run naive twoway FE event-studies
 
-Create event study data. 
-
-
+Create event study data.
 
 ### Same adoption and stable treatment effect.
 
@@ -470,8 +584,6 @@ unique_vals = unique_vals[!(unique_vals == -1)]
 timing_yes_growing_yes_es_data = temp
 ```
 
-
-
 ### Staggered adoption and stable treatment effect.
 
 ```{r}
@@ -512,7 +624,6 @@ unique_vals = unique_vals[!(unique_vals == -1)]
 timing_yes_growing_no_es_data = temp
 ```
 
-
 ### Same adoption and growing treatment effect.
 
 ```{r}
@@ -521,6 +632,7 @@ low_cap = -8
 #state_pc, year, high_cap, low_cap, timing_no_growing_no
 # id, time, high_cap, low_cap, dataset
 ```
+
 ```{r}
 # Create a temporary dataset that creates "event-time" and caps this variable. 
     # Never treated units get set to -1
@@ -552,8 +664,8 @@ unique_vals = unique_vals[!(unique_vals == -1)]
 timing_no_growing_yes_es_data = temp
 ```
 
-
 ### Same adoption and stable treatment effect.
+
 ```{r}
 high_cap = 8
 low_cap = -8
@@ -652,6 +764,7 @@ timing_no_growing_no_es_results = event_study_regression(dataset = timing_no_gro
 ```
 
 ## Plot naive event studies
+
 ```{r}
 timing_yes_growing_yes_es_plot = plot_event_study(event_study_results = timing_yes_growing_yes_es_results,
                                      low_cap = -9,
@@ -718,7 +831,8 @@ ggplot(timing_yes_growing_yes_bacon) +
   geom_hline(yintercept = 0) + 
   theme_minimal() +
   labs(x = "Weight", y = "Estimate", shape = "Type")
-```    
+```
+
 ### Staggered adoption and stable treatment effect.
 
 ```{r}
@@ -735,7 +849,8 @@ ggplot(timing_yes_growing_no_bacon) +
   geom_hline(yintercept = 0) + 
   theme_minimal() +
   labs(x = "Weight", y = "Estimate", shape = "Type")
-```                  
+```
+
 ### Same adoption and growing treatment effect.
 
 ```{r}
@@ -752,7 +867,8 @@ ggplot(timing_no_growing_yes_bacon) +
   geom_hline(yintercept = 0) + 
   theme_minimal() +
   labs(x = "Weight", y = "Estimate", shape = "Type")
-```    
+```
+
 ### Same adoption and stable treatment effect.
 
 ```{r}
@@ -771,7 +887,7 @@ ggplot(timing_no_growing_no_bacon) +
   labs(x = "Weight", y = "Estimate", shape = "Type")
 
 
-```   
+```
 
 ```{r}
 timing_yes_growing_yes_feols = timing_yes_growing_yes
@@ -782,6 +898,9 @@ timing_yes_growing_yes_feols[, event_time := year - fake_year_treated]
 
 timing_yes_growing_yes_feols[, event_time := ifelse(fake_year_treated == 2020, -1, event_time)]
 
+timing_yes_growing_yes_feols[,event_time_capped := ifelse(event_time > 8,  9, ifelse( event_time < -8,  -9, event_time))]
+
+
 mod_twfe = feols(fake_value*100000 ~ i(event_time, ref = -1)  ## Our key interaction: time × treatment status
           |                    ## Other controls
           state_pc + year,                             ## FEs
@@ -790,7 +909,8 @@ mod_twfe = feols(fake_value*100000 ~ i(event_time, ref = -1)  ## Our key interac
 
 iplot(mod_twfe, 
       xlab = 'Time to treatment',
-      main = 'Event study: Staggered treatment (TWFE)')
+      main = 'Event study: Staggered treatment (TWFE)', 
+      drop = "event_time::[-2-2]$")
 ```
 
 ```{r}
@@ -806,10 +926,19 @@ summary(mod_sa, agg = "ATT")
 iplot(list(mod_twfe, mod_sa), sep = 0.5, ref.line = -1,
       xlab = 'Time to treatment',
       main = 'Event study: Staggered treatment')
+
+# Add the true results
+#att_true = tapply(base_stagg$treatment_effect_true, base_stagg$time_to_treatment, mean)[-1]
+#points(-9:8, att_true, pch = 15, col = 4)
+
+#legend("topleft", col = c(1, 4, 2), pch = c(20, 15, 17), 
+ #      legend = c("TWFE", "Truth", "Sun & Abraham (2020)"))
 legend("bottomleft", col = c(1, 2), pch = c(20, 17), 
        legend = c("TWFE", "Sun & Abraham (2020)"))
-```
 
+ggiplot(list('TWFE' = mod_twfe, 'Sun & Abraham (2020)' = mod_sa), ref.line = -1)
+
+```
 
 ## CS
 

@@ -1,0 +1,636 @@
+---
+title: "Antibiotics and mortality"
+format: 
+  html:
+    self-contained: true
+    toc: true
+---
+
+## Load packages
+
+```{r, echo = FALSE}
+# Load packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(data.table, ggplot2, haven, fixest, collapse, bacondecomp, did, ggrepel)
+
+## Clear memory
+rm(list=ls())
+
+# Set seed 
+set.seed(1234)
+
+# Disable scientific notation
+options(scipen=999)
+```
+
+# Examine real mortality data from AEJ-Applied paper
+
+## View time-series
+
+```{r, load-data}
+# State-level data for regressions
+state_mortality = as.data.table(haven::read_dta("data/raw/113743-V1/AEJApp-20080229_Datasets/20080229_state_data.dta"))
+
+    # Make sure things we want to look at are in the same units
+    state_mortality[, infl_pneumonia_rate := infl_pneumonia_rate*100000]
+    state_mortality[, tb_rate := tb_rate*100000]
+
+# National level data for image 
+national_mortality =  as.data.table(haven::read_dta("data/raw/113743-V1/AEJApp-20080229_Datasets/20080229_national_data.dta"))
+
+```
+
+Quick look at the data
+
+```{r, time-series-plot}
+flu_plot = ggplot(data = subset(national_mortality, year >= 1928), 
+                  aes(x = year, y = (influenza_pneumonia_total))) + 
+    geom_point(size = 3, alpha = .75) + 
+    theme_classic(base_size = 14) +
+    geom_vline(xintercept = 1937, linetype="dashed") +
+    labs(title = "Influenza and pneumonia mortality rate across time", 
+         y = "", 
+         subtitle = "Death rate per 100,000",
+         x = "Year") +
+    theme(legend.position = "none") 
+
+flu_plot
+```
+
+```{r, save-time-series-plot, echo = FALSE}
+ggsave(plot = flu_plot, 
+       filename = "output/flu-mortality-1928-1950.pdf", 
+      height = 6,
+      width = 9,
+      units = "in")
+```
+
+
+## Simple DiD
+
+Compare changes in influenza death rates, before and after the invention of sulfa-drugs, to changes in tuberculosis death rates. Original AEJ paper discusses how TB was less affected. 
+
+### Time-series comparison
+
+```{r compare-time-series-to-tb, echo = FALSE}
+national_mortality[,one:=1]
+national_mortality[,two:=2]
+
+ggplot(data = subset(national_mortality, year >= 1928), aes(x = year, y = (influenza_pneumonia_total), shape = as.factor(one))) + 
+    geom_point(size = 3, alpha = .75) + 
+    theme_classic(base_size = 14) +
+    geom_vline(xintercept = 1937, linetype="dashed") +
+    labs(title = "Influenza and pneumonia mortality rate across time", 
+         y = "", 
+         subtitle = "Death rate per 100,000",
+         x = "Year") +
+    theme(legend.position = "none") +
+    geom_point(data = subset(national_mortality, year >= 1928), aes(x = year, y = (tuberculosis_total), shape = as.factor(two)), size = 3, alpha = .75) +
+        theme_classic(base_size = 14) +
+    labs(title = "Mortality rate across time", 
+         y = "", 
+         subtitle = "Death rate per 100,000",
+         x = "Year") +
+      scale_shape_manual(name = "", values=c(16, 17), labels = c("Influenza/pneumonia", "Tuberculosis"),  guide = 'legend') + 
+  theme(legend.position = c(.8, 1))
+```
+
+### DiD comparison
+
+To make this comparison, I will first work with the state-level data. We will reshape the data, call treatment 1937 and after, create post $\times$ treat variable. 
+
+```{r, reshape-state-data, echo = FALSE}
+
+# Reshape the data
+state_mortality_reshape = melt(state_mortality, id.vars = c("state_pc", "year"),
+                measure.vars = c("tb_rate", "infl_pneumonia_rate"))
+
+# Create treatment variables
+state_mortality_reshape[, treated_disease := ifelse(variable == "tb_rate", 0, 1)]
+state_mortality_reshape[, treated_time := ifelse(year >= 1937, 1, 0)]
+state_mortality_reshape[, treated := treated_time*treated_disease]
+
+```
+
+Run simple DiD
+
+```{r, simple-did}
+simple_did = fixest::feols(value  ~ treated | treated_disease + state_pc + year, 
+              data = state_mortality_reshape)
+etable(simple_did)
+
+effect = simple_did$coeftable[1,1]
+```
+
+
+There is a `r round(effect, 1)` change in the influenza and pneumonia mortality rate per 100,000, relative to the change in tuberculosis mortality, following the advent of sulfa-drugs. 
+
+
+# Example using fake data
+
+Add random variable to each state to get fake treated_year
+
+First create percentiles
+
+```{r}
+quantiles = state_mortality[year == 1928, .(untreated = quantile(infl_pneumonia_rate, 0.25, na.rm = TRUE), low = quantile(infl_pneumonia_rate, 0.5, na.rm = TRUE), high = quantile(infl_pneumonia_rate, 0.75, na.rm = TRUE))]
+```
+
+Use these percentiles to create cutoffs in fake treatment.
+
+-   Lowest 25% is "never treated"
+
+-   25-50% is late
+
+-   50-75% is middle
+
+-   75%+ is early
+
+```{r}
+
+state_mortality[year == 1928, fake_year_treated := ifelse(infl_pneumonia_rate <= quantiles$untreated, 2020, ifelse(infl_pneumonia_rate > quantiles$untreated & infl_pneumonia_rate <= quantiles$low, 1945,
+                                     ifelse(infl_pneumonia_rate > quantiles$low & infl_pneumonia_rate <= quantiles$high, 1940, 1930)))]
+
+state_mortality = state_mortality[, fake_year_treated := fake_year_treated[year == 1928], by = state_pc]
+
+```
+
+## Create data with staggered adoption, growing, and heterogenous treatment effect.
+
+```{r}
+# Keep only the variables that we need from 1928
+timing_yes_growing_yes = state_mortality[year == 1928,.(state_pc, infl_pneumonia_rate, fake_year_treated, pop3)]
+
+# Expand the dataset to be from 1928 until 1950
+full_state_year_grid = data.table(expand.grid(year=1928:1950, state_pc =unique(timing_yes_growing_yes$state_pc)))
+
+# Create error
+error_mean = 0
+error_sd = 10
+error_scale = 1
+
+full_state_year_grid[,rand_e:=1-rnorm(.N, 0, error_sd)]
+full_state_year_grid[year == 1928, rand_st:=1-rnorm(.N, 0, error_sd)]
+full_state_year_grid[state_pc == "AL", rand_yr:=1-rnorm(.N, 0, error_sd)]
+
+full_state_year_grid = full_state_year_grid[, rand_st := rand_st[year == 1928], by = state_pc]
+full_state_year_grid = full_state_year_grid[, rand_yr := rand_yr[state_pc == "AL"], by = year]
+
+# Merge the two togethers
+timing_yes_growing_yes = merge(timing_yes_growing_yes, full_state_year_grid, by = "state_pc")
+
+# Add fake treatment status in each year
+timing_yes_growing_yes[, treated := ifelse(year >= fake_year_treated, 1, 0)]
+
+# Add "natural" slope from pre-trend
+timing_yes_growing_yes[, fake_value := infl_pneumonia_rate - .1*rand_st + .05*rand_yr + .1*rand_e]
+
+# Add treatment effect
+timing_yes_growing_yes[, fake_value := ifelse(fake_year_treated == 1940, fake_value + 0*effect*treated + (.2*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated), ifelse(fake_year_treated == 1945, fake_value + 0*effect*treated + (.1*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated),fake_value + 0*effect*treated + (.3*simple_did$coeftable[1,1]*(year - fake_year_treated)*treated)))]
+
+# Bound at zero
+timing_yes_growing_yes[, fake_value := ifelse(fake_value < 0, 0, fake_value)]
+
+# Calculate true treatment effect 
+timing_yes_growing_yes[, true_treatment_effect := fake_value - (infl_pneumonia_rate - .1*rand_st + .05*rand_yr + .1*rand_e)]
+
+# Collapse into timing groups
+timing_yes_growing_yes_collapsed = collap(timing_yes_growing_yes, ~ year + fake_year_treated, fmean, cols = 10, w = timing_yes_growing_yes$pop3)
+
+
+```
+Determine true treatment effect, ATT by group, and avg-ATT by treated year
+```{r}
+# Now figure out 
+    # the average treatment effect for each group
+    # the average treatment effect on the treated. 
+
+yearly_true_treatment_effect = timing_yes_growing_yes[, list(avg_true_treatment_effect = fmean(true_treatment_effect),
+                                             count = fnobs(true_treatment_effect)),
+                                      by = c("fake_year_treated", "treated", "year")]
+yearly_true_treatment_effect[treated == 1, event_time := year - fake_year_treated]
+annual_avg_treatment_effect = yearly_true_treatment_effect[, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect, w = count), weight_for_total = fsum(count)),
+                                      by = c("event_time")]
+
+
+group_true_treatment_effect = timing_yes_growing_yes[, list(mean = fmean(true_treatment_effect),
+                                             count = fnobs(true_treatment_effect)),
+                                      by = c("fake_year_treated", "treated")]
+
+group_att = group_true_treatment_effect[treated == 1]
+```
+
+
+Plot data
+
+```{r}
+timing_yes_growing_yes_plot = ggplot(data = timing_yes_growing_yes_collapsed,
+                                    aes(x = year, y = (fake_value), shape = as.factor(fake_year_treated))) + 
+    geom_point(size = 3, alpha = .66) + 
+    theme_classic(base_size = 14) +
+    geom_vline(xintercept = 1944.5, linetype="dashed") +
+    geom_vline(xintercept = 1929.5, linetype="dashed") +
+    geom_vline(xintercept = 1939.5, linetype="dashed") +
+    labs(title = "Fake treatment, staggered adoption, growing treatment", 
+         y = "", 
+         subtitle = "Influenza/pneumonia mortality death rate per 100,000",
+         x = "Year") +
+      scale_shape_manual(name = "", 
+                         values=c(15, 16, 17, 4), 
+                         labels = c("Early", 
+                                    "Middle", 
+                                    "Late", 
+                                    "Never"),  
+                         guide = 'legend') + 
+  theme(legend.position = c(.9, .9))
+timing_yes_growing_yes_plot
+```
+
+```{r, save-fake-time-series-plot, echo = FALSE}
+ggsave(plot = timing_yes_growing_yes_plot, 
+       filename = "output/fake-data-flu-mortality-1928-1950.pdf", 
+      height = 6,
+      width = 9,
+      units = "in")
+```
+
+
+## Estimate ATT
+
+### Two way fixed-effects
+```{r}
+timing_yes_growing_yes_twfe = fixest::feols(fake_value ~ treated | state_pc + year, data = timing_yes_growing_yes)
+
+# Estimate of the treatment effect is 
+timing_yes_growing_yes_twfe$coeftable[1,1]
+timing_yes_growing_yes_twfe
+```
+
+### Sun & Abraham (2020)
+
+```{r}
+timing_yes_growing_yes_sa = feols(fake_value ~ sunab(fake_year_treated, year)  ## Our key interaction: time × treatment status
+		  |                    ## Other controls
+		  state_pc + year,                             ## FEs
+		 cluster = ~state_pc,                          ## Clustered SEs
+		 data = timing_yes_growing_yes)
+sa_output = summary(timing_yes_growing_yes_sa, agg = "ATT")
+sa_output
+```
+
+### Callaway Sant'Anna
+
+```{r}
+# Make a copy so we don't override. 
+timing_yes_growing_yes_cs = copy(timing_yes_growing_yes)
+
+# Create numeric state-group
+timing_yes_growing_yes_cs[,state_group := as.numeric(as.factor(state_pc))]
+
+# Never treated should be set to zero
+timing_yes_growing_yes_cs[,fake_year_treated := ifelse(fake_year_treated == 2020, 0, fake_year_treated)]
+
+# Run CS
+timing_yes_growing_yes_attgt = att_gt(yname = "fake_value",
+                        tname = "year",
+                        idname = "state_group",
+                        gname = "fake_year_treated",
+                        xformla = ~1,
+                        data = timing_yes_growing_yes_cs
+                        )
+
+timing_yes_growing_yes_cs = aggte(timing_yes_growing_yes_attgt, type = "dynamic")
+summary(timing_yes_growing_yes_cs)
+```
+
+## Plot the three ATT comparisons next to one another. 
+
+```{r}
+
+
+ # Create storage dataset. 
+  storage_temp = data.table(order = numeric(), b=numeric(), se=numeric(), Method=character())
+  
+  # Add TWFE results to storage dataset
+    temp = as.data.table(
+            cbind(
+                1, 
+                timing_yes_growing_yes_twfe$coeftable[1,1], 
+                timing_yes_growing_yes_twfe$coeftable[1,2], 
+                "TWFE"
+                )
+            )
+    storage_temp = rbind(storage_temp, temp, 
+                                           use.names = FALSE)
+    
+    # Add SA results to storage dataset
+    temp = as.data.table(
+            cbind(
+                2, 
+                sa_output$coeftable[,1], 
+                sa_output$coeftable[,2], 
+                "Sun & Abraham (2020)"
+                )
+            )
+    storage_temp = rbind(storage_temp, temp, 
+                                           use.names = FALSE)
+    
+      
+
+    # Add CS results to storage dataset
+    temp = as.data.table(
+            cbind(
+                3, 
+                timing_yes_growing_yes_cs$overall.att, 
+                timing_yes_growing_yes_cs$overall.se, 
+                "Callaway Sant'Anna"
+                )
+            )
+    timing_yes_growing_yes_att_data = rbind(storage_temp, temp, 
+                                           use.names = FALSE)
+    
+    # Ensure storage is numeric where it should be
+    timing_yes_growing_yes_att_data[, b := as.numeric(b)]
+    timing_yes_growing_yes_att_data[, se := as.numeric(se)]
+    timing_yes_growing_yes_att_data[, order := as.numeric(order)]
+
+```
+
+Plot the ATTs next to one another. 
+```{r, plot-att}
+    # Add truth 
+    true_avg_att = annual_avg_treatment_effect[event_time > 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect, w = weight_for_total))]
+    true_avg_att = mean(true_avg_att$avg_true_treatment_effect)
+timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data, 
+       aes(x = factor(order), 
+           y = b, 
+           ymin = b - 1.96*se, 
+           ymax = b + 1.96*se,
+           shape = Method, 
+           color = Method)) + 
+    geom_point(size=3) +
+    geom_errorbar(width=0.05) +
+    theme_minimal() +
+    geom_hline(yintercept = 0) +
+    geom_hline(yintercept = true_avg_att, linetype = "dashed") +
+    annotate("text", label = "True ATT", x = 3, y = true_avg_att*.95, size = 4)   +
+    labs(title = "ATT estimates by method", 
+         y = "", 
+         subtitle = "Change in influenza/pneumonia mortality death rate per 100,000", 
+         x = "")  + 
+    scale_x_discrete(breaks=c("1","2","3"),
+        labels=c("TWFE", "Sun & Abraham (2020)", "Callaway Sant'Anna")) +
+    theme_classic(base_size = 14) +
+theme(legend.position = "none")
+timing_yes_growing_yes_att_plot
+```
+```{r, save-fake-att-comparison, echo = FALSE}
+ggsave(plot = timing_yes_growing_yes_att_plot, 
+       filename = "output/fake-data-att-comparison.pdf", 
+      height = 6,
+      width = 9,
+      units = "in")
+```
+
+### Bacon-decomposition to confirm ATT from TWFE
+
+```{r}
+timing_yes_growing_yes_bacon = bacon(fake_value ~ treated,
+                  data = as.data.frame(timing_yes_growing_yes),
+                  id_var = "state_pc",
+                  time_var = "year")
+timing_yes_growing_yes_bacon = as.data.table(timing_yes_growing_yes_bacon)
+timing_yes_growing_yes_bacon[, untreated := ifelse(untreated == 99999, "Never", untreated)]
+
+timing_yes_growing_yes_bacon[, label := do.call(paste, c(.SD, sep = " vs. ")), .SDcols = c("treated", "untreated")]
+
+# Show bacon decomp 
+timing_yes_growing_yes_bacon
+
+# Now compare this to the group-specific real ATT
+group_att
+
+# weighted average of the decomposition, this should be the same as TWFE DiD
+sum(timing_yes_growing_yes_bacon$estimate * timing_yes_growing_yes_bacon$weight)
+```
+```{r}
+att_1930 = unlist(group_att[fake_year_treated == 1930, .(mean)])
+att_1940 = unlist(group_att[fake_year_treated == 1940, .(mean)])
+att_1945 = unlist(group_att[fake_year_treated == 1945, .(mean)])
+```
+Plot the decomposition
+```{r}
+timing_yes_growing_yes_bacon_plot = ggplot(timing_yes_growing_yes_bacon) +
+      geom_hline(yintercept = att_1930, linetype = "dashed") +
+    geom_hline(yintercept = att_1940, linetype = "dashed") +
+    geom_hline(yintercept = att_1945, linetype = "dashed") +
+  aes(x = weight, y = estimate, shape = factor(type), label = label, color = factor(type)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0) + 
+  theme_minimal() +
+        geom_point(x = .2, y = att_1940, alpha = 0, size = 3) +
+    geom_point(x = .2, y = -30, size = 3, alpha = 0) +
+    geom_point(x = .2, y = -25, size = 3, alpha = 0) +
+    annotate("text", label = "True 1930", x = .2, y = att_1930*.95, size = 4)   +
+    annotate("text", label = "True 1940", x = .205, y = -32, size = 4)    +
+    annotate("text", label = "True 1945", x = .205, y = -11, size = 4)    +
+          geom_label_repel(force = 10, max.time = 10, show.legend = FALSE, seed = 1234) +
+  labs(x = "Weight", y = "Estimate", shape = "Type", color = "Type", title = "Bacon decomposition") 
+
+
+ 
+  
+
+timing_yes_growing_yes_bacon_plot
+```
+
+
+```{r, echo = FALSE}
+ggsave(plot = timing_yes_growing_yes_bacon_plot, 
+       filename = "output/bacon-decomposition.pdf", 
+      height = 6,
+      width = 9,
+      units = "in")
+```
+
+## Event-study
+
+```{r event-study-function, echo = FALSE, eval = TRUE}
+
+es_plot = function(dt, id_var, time_var, year_treated_var, value_var, untreated_value, ref_value = -1) {
+  # Create new temp data.table
+  dt_temp = copy(dt)
+  
+  # Add event-time
+  dt_temp[, event_time := get(time_var) - get(year_treated_var)]
+  dt_temp[, event_time := ifelse(get(year_treated_var) == untreated_value, ref_value,  event_time)]
+
+  # Add ever treated
+  dt_temp[, ever_treated := ifelse(get(year_treated_var) != untreated_value, 1,  0)]
+  
+  # Create storage dataset. 
+  storage_temp = data.table(event_time = numeric(), b=numeric(), se=numeric(), Method=character())
+  
+  # Run TWFE
+  formula = as.formula(paste0(value_var, " ~ i(event_time, ever_treated, ref = ", ref_value, ")",
+                               " | ", id_var, " + ", time_var))
+
+  did_temp = fixest::feols(formula, data = dt_temp)
+  
+  # Add results to storage dataset
+    temp = as.data.table(
+            cbind(
+                did_temp$model_matrix_info[[1]]$items, 
+                append(did_temp$coefficients, 0, abs(min(did_temp$model_matrix_info[[1]]$items))-1), 
+                append(did_temp$se, 0, abs(min(did_temp$model_matrix_info[[1]]$items))-1), 
+                rep("TWFE",each=length(did_temp$model_matrix_info[[1]]$items))
+                )
+            )
+    storage_temp = rbind(storage_temp, temp, 
+                                           use.names = FALSE)
+    
+  # Run Sun and Abraham
+  formula_sa = as.formula(paste0(value_var, " ~ sunab(" , year_treated_var, ", ", time_var, ")",
+                               " | ", id_var, " + ", time_var))
+  
+  sa_temp = fixest::feols(formula_sa, data = dt_temp)
+    
+  # Extract coefs
+  coef_sa_temp = sa_temp$coeftable
+  
+  # Add results to storage dataset
+  temp = as.data.table(
+            cbind(
+                sa_temp$model_matrix_info[[1]]$items, 
+                append(coef_sa_temp[,1], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
+                append(coef_sa_temp[,2], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
+                rep("Sun & Abraham (2020)",
+                    each=length(sa_temp$model_matrix_info[[1]]$items))
+                )
+            )
+    storage_temp = rbind(storage_temp, temp, 
+                                       use.names = FALSE)
+
+    # Callaway Sant'Anna
+    
+    # Turn id var into numeric
+    dt_temp[,state_group := as.numeric(as.factor(get(id_var)))]
+    
+    # Make sure that untreated year is set to zero
+    dt_temp[ ,year_treated_temp := ifelse(get(year_treated_var) == untreated_value, 0, get(year_treated_var))]
+    
+ 
+    # Run CS
+    example_attgt = att_gt(yname = value_var,
+                        tname = time_var,
+                        idname = "state_group",
+                        gname = "year_treated_temp",
+                        xformla = ~1,
+                        data = dt_temp
+                        )
+    # Aggregate
+    es = aggte(example_attgt, type = "dynamic")
+
+    # Add to temp storage
+    temp = as.data.table(
+            cbind(
+               es$egt, 
+                es$att.egt, 
+                es$se.egt, 
+                rep("Callaway Sant'Anna", each=length(es$egt))
+                )
+            )
+    
+    storage_temp = rbind(storage_temp, temp, 
+                                       use.names = FALSE)
+    
+    # Add truth 
+       truth_to_add =  annual_avg_treatment_effect[event_time > 0, se := 0]
+    temp = as.data.table(
+            cbind(
+               truth_to_add$event_time, 
+                truth_to_add$avg_true_treatment_effect, 
+                truth_to_add$se, 
+                rep("True avg effect", each=length(es$egt))
+                )
+            )
+    
+    storage_temp = rbind(storage_temp, temp, 
+                                       use.names = FALSE)
+    
+    
+    # Ensure storage is numeric where it should be
+    storage_temp[, b := as.numeric(b)]
+    storage_temp[, se := as.numeric(se)]
+    storage_temp[, event_time := as.numeric(event_time)]
+    
+    # Return value
+    return(storage_temp)
+}
+```
+
+Run TWFE, Sun Abraham, and CS event-studies, storing coefs and se. 
+
+```{r, run-es-code}
+timing_yes_growing_yes_es_data = es_plot(
+    dt = timing_yes_growing_yes, 
+    id_var = "state_pc",
+    time_var = "year",
+    year_treated_var = "fake_year_treated",
+    value_var = "fake_value",
+    untreated_value = 2020,
+    ref_value = -1
+)
+```
+
+Plot the event-studies on top of one another. 
+```{r, plot-es}
+timing_yes_growing_yes_es_plot = ggplot(data = timing_yes_growing_yes_es_data, 
+       aes(x = event_time, 
+           y = b, 
+           ymin = b - 1.96*se, 
+           ymax = b + 1.96*se,
+           shape = Method, 
+           color = Method)) + 
+    geom_point(size=2) +
+    geom_errorbar(width=0.1) +
+    theme_minimal() +
+    geom_vline(xintercept = -.5) +
+    geom_hline(yintercept = 0) +
+    labs(title = "Event-study estimates by method", 
+         y = "", 
+         subtitle = "Change in influenza/pneumonia mortality death rate per 100,000", 
+         x = "Years since sulfa available in state")  + 
+  theme(legend.position = c(.875, .75))
+timing_yes_growing_yes_es_plot
+```
+
+```{r, save-es-series-plot, echo = FALSE}
+ggsave(plot = timing_yes_growing_yes_es_plot, 
+       filename = "output/timing_yes_growing_yes_es_plot.pdf", 
+      height = 6,
+      width = 9,
+      units = "in")
+```
+
+Zoom into -8 to +8, where the majority of treated years are, to see how TWFE is different that other two methods. 
+
+```{r, plot-es-zoom}
+timing_yes_growing_yes_es_zoom_plot = timing_yes_growing_yes_es_plot + 
+    xlim(-8.5, 8) +
+    ylim(-35, 5)  + 
+  theme(legend.position = c(.875, .7))
+
+timing_yes_growing_yes_es_zoom_plot
+```
+
+
+```{r}
+ggsave(plot = timing_yes_growing_yes_es_zoom_plot, 
+       filename = "output/timing_yes_growing_yes_es_zoom_plot.pdf", 
+      height = 6,
+      width = 9,
+      units = "in")
+```
+
+

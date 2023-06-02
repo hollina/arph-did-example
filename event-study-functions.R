@@ -1,3 +1,7 @@
+## Note: requires that both fixest and ggplot2 are installed and loaded
+# library(fixest)
+# library(ggplot2
+
 ## Run event-study regression
 event_study_regression <- function(dataset, id, time, treated, y_var, dd_control_list = NULL, control_list = NULL, fixed_effects, cluster_var, high_cap, low_cap){
     
