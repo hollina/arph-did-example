@@ -46,7 +46,7 @@ Quick look at the data
 flu_plot = ggplot(data = subset(national_mortality, year >= 1928), 
                   aes(x = year, y = (influenza_pneumonia_total))) + 
     geom_point(size = 3, alpha = .75) + 
-    theme_classic(base_size = 14) +
+    theme_classic(base_size = 18) +
     geom_vline(xintercept = 1937, linetype="dashed") +
     labs(title = "Influenza and pneumonia mortality rate across time", 
          y = "", 
@@ -227,11 +227,11 @@ Plot data
 timing_yes_growing_yes_plot = ggplot(data = timing_yes_growing_yes_collapsed,
                                     aes(x = year, y = (fake_value), shape = as.factor(fake_year_treated))) + 
     geom_point(size = 3, alpha = .66) + 
-    theme_classic(base_size = 14) +
+    theme_classic(base_size = 18) +
     geom_vline(xintercept = 1944.5, linetype="dashed") +
     geom_vline(xintercept = 1929.5, linetype="dashed") +
     geom_vline(xintercept = 1939.5, linetype="dashed") +
-    labs(title = "Fake treatment, staggered adoption, growing treatment", 
+    labs(title = "", 
          y = "", 
          subtitle = "Influenza/pneumonia mortality death rate per 100,000",
          x = "Year") +
@@ -276,6 +276,19 @@ timing_yes_growing_yes_sa = feols(fake_value ~ sunab(fake_year_treated, year)  #
 		 data = timing_yes_growing_yes)
 sa_output = summary(timing_yes_growing_yes_sa, agg = "ATT")
 sa_output
+```
+### Stacked
+
+Not sure of R command for this. So I am exporting to stata. 
+```{r}
+fwrite(timing_yes_growing_yes, 
+       file = "timing_yes_growing_yes.csv")
+```
+
+Read in ATT and Event study
+```{r}
+timing_yes_growing_yes_stacked_att = fread("timing_yes_growing_yes_stacked_att.csv")
+timing_yes_growing_yes_stacked_es = fread("timing_yes_growing_yes_stacked_es.csv")
 ```
 
 ### Callaway Sant'Anna
@@ -346,9 +359,21 @@ summary(timing_yes_growing_yes_cs)
                 "Callaway Sant'Anna"
                 )
             )
-    timing_yes_growing_yes_att_data = rbind(storage_temp, temp, 
+    storage_temp = rbind(storage_temp, temp, 
                                            use.names = FALSE)
     
+    # Add Stacked results to storage dataset
+    temp = as.data.table(
+            cbind(
+                4, 
+                timing_yes_growing_yes_stacked_att$b[1], 
+                timing_yes_growing_yes_stacked_att$se[1], 
+                "Stacked"
+                )
+            )
+    timing_yes_growing_yes_att_data = rbind(storage_temp, temp, 
+                                           use.names = FALSE)
+
     # Ensure storage is numeric where it should be
     timing_yes_growing_yes_att_data[, b := as.numeric(b)]
     timing_yes_growing_yes_att_data[, se := as.numeric(se)]
@@ -373,14 +398,14 @@ timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data,
     theme_minimal() +
     geom_hline(yintercept = 0) +
     geom_hline(yintercept = true_avg_att, linetype = "dashed") +
-    annotate("text", label = "True ATT", x = 3, y = true_avg_att*.95, size = 4)   +
+    annotate("text", label = "True ATT", x = 4.4, y = true_avg_att*.95, size = 4)   +
     labs(title = "ATT estimates by method", 
          y = "", 
          subtitle = "Change in influenza/pneumonia mortality death rate per 100,000", 
          x = "")  + 
-    scale_x_discrete(breaks=c("1","2","3"),
-        labels=c("TWFE", "Sun & Abraham (2020)", "Callaway Sant'Anna")) +
-    theme_classic(base_size = 14) +
+    scale_x_discrete(breaks=c("1","2","3", "4"),
+        labels=c("TWFE", "Sun & Abraham (2020)", "Callaway Sant'Anna", "Stacked")) +
+    theme_classic(base_size = 18) +
 theme(legend.position = "none")
 timing_yes_growing_yes_att_plot
 ```
@@ -427,7 +452,7 @@ timing_yes_growing_yes_bacon_plot = ggplot(timing_yes_growing_yes_bacon) +
   aes(x = weight, y = estimate, shape = factor(type), label = label, color = factor(type)) +
   geom_point(size = 3) +
   geom_hline(yintercept = 0) + 
-  theme_minimal() +
+  theme_minimal(base_size = 18) +
         geom_point(x = .2, y = att_1940, alpha = 0, size = 3) +
     geom_point(x = .2, y = -30, size = 3, alpha = 0) +
     geom_point(x = .2, y = -25, size = 3, alpha = 0) +
@@ -435,7 +460,10 @@ timing_yes_growing_yes_bacon_plot = ggplot(timing_yes_growing_yes_bacon) +
     annotate("text", label = "True 1940", x = .205, y = -32, size = 4)    +
     annotate("text", label = "True 1945", x = .205, y = -11, size = 4)    +
           geom_label_repel(force = 10, max.time = 10, show.legend = FALSE, seed = 1234) +
-  labs(x = "Weight", y = "Estimate", shape = "Type", color = "Type", title = "Bacon decomposition") 
+  labs(x = "Weight", y = "Estimate", shape = "Type", color = "Type", title = "Bacon decomposition") +
+     guides(col = guide_legend(ncol = 3)) +
+    theme(legend.position="bottom", 
+          legend.title = element_blank())
 
 
  
@@ -538,6 +566,19 @@ es_plot = function(dt, id_var, time_var, year_treated_var, value_var, untreated_
                 es$att.egt, 
                 es$se.egt, 
                 rep("Callaway Sant'Anna", each=length(es$egt))
+                )
+            )
+    
+    storage_temp = rbind(storage_temp, temp, 
+                                       use.names = FALSE)
+    
+    # Add Stacked temp storage
+    temp = as.data.table(
+            cbind(
+               timing_yes_growing_yes_stacked_es$type, 
+                timing_yes_growing_yes_stacked_es$b, 
+                timing_yes_growing_yes_stacked_es$se, 
+                rep("Stacked", each=length(timing_yes_growing_yes_stacked_es$se))
                 )
             )
     
