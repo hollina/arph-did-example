@@ -1,4 +1,4 @@
-import delimited "~/Documents/GitHub/ajph-did-example/stata/timing_yes_growing_yes.csv", clear 
+import delimited "~/Documents/GitHub/arph-did-example/stata/timing_yes_growing_yes.csv", clear 
 
 // Run simple TWFE to show issue. 
 reghdfe fake_value treated, absorb(year state_pc) vce(cluster state_pc)
@@ -50,7 +50,7 @@ rename  results1 b
 rename  results2 se
 
 drop if missing(b)
-outsheet b se using"~/Documents/GitHub/ajph-did-example/stata/timing_yes_growing_yes_stacked_att.csv" , comma replace
+outsheet b se using"~/Documents/GitHub/arph-did-example/stata/timing_yes_growing_yes_stacked_att.csv" , comma replace
 
 restore
 stackedev fake_value F_*  L_* ref, cohort(fake_year_treated) time(year) never_treat(no_treat) unit_fe(id) clust_unit(id)
@@ -80,7 +80,7 @@ destring type, replace force
 sort type
 order type
 replace se = 0 if type == -1
-outsheet type b se using"~/Documents/GitHub/ajph-did-example/stata/timing_yes_growing_yes_stacked_es.csv" , comma replace
+outsheet type b se using"~/Documents/GitHub/arph-did-example/stata/timing_yes_growing_yes_stacked_es.csv" , comma replace
 
 exit
 
