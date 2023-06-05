@@ -266,17 +266,6 @@ timing_yes_growing_yes_twfe$coeftable[1,1]
 timing_yes_growing_yes_twfe
 ```
 
-### Sun & Abraham (2020)
-
-```{r}
-timing_yes_growing_yes_sa = feols(fake_value ~ sunab(fake_year_treated, year)  ## Our key interaction: time × treatment status
-		  |                    ## Other controls
-		  state_pc + year,                             ## FEs
-		 cluster = ~state_pc,                          ## Clustered SEs
-		 data = timing_yes_growing_yes)
-sa_output = summary(timing_yes_growing_yes_sa, agg = "ATT")
-sa_output
-```
 ### Stacked
 
 Not sure of R command for this. So I am exporting to stata. 
@@ -314,7 +303,92 @@ timing_yes_growing_yes_attgt = att_gt(yname = "fake_value",
 
 timing_yes_growing_yes_cs = aggte(timing_yes_growing_yes_attgt, type = "dynamic")
 summary(timing_yes_growing_yes_cs)
+
 ```
+
+### Bacon-decomposition to compare ATT from TWFE and stacked
+
+```{r}
+timing_yes_growing_yes_bacon = bacon(fake_value ~ treated,
+                  data = as.data.frame(timing_yes_growing_yes),
+                  id_var = "state_pc",
+                  time_var = "year")
+timing_yes_growing_yes_bacon = as.data.table(timing_yes_growing_yes_bacon)
+timing_yes_growing_yes_bacon[, untreated := ifelse(untreated == 99999, "Never", untreated)]
+
+timing_yes_growing_yes_bacon[, label := do.call(paste, c(.SD, sep = " vs. ")), .SDcols = c("treated", "untreated")]
+
+# Show bacon decomp 
+timing_yes_growing_yes_bacon
+
+# Now compare this to the group-specific real ATT
+group_att
+
+# weighted average of the decomposition, this should be the same as TWFE DiD
+bacon_twfe = sum(timing_yes_growing_yes_bacon$estimate * timing_yes_growing_yes_bacon$weight)
+bacon_twfe
+```
+
+```{r}
+# Get weighted average of *just* Treated vs Untreated
+timing_yes_growing_yes_bacon_clean = as.data.table(timing_yes_growing_yes_bacon)
+
+timing_yes_growing_yes_bacon_clean = timing_yes_growing_yes_bacon_clean[type == "Treated vs Untreated"]
+
+sum_of_clean = sum(timing_yes_growing_yes_bacon_clean$weight)
+
+timing_yes_growing_yes_bacon_clean[,weight := weight/sum_of_clean]
+
+# weighted average of the decomposition, this should be the same as TWFE DiD
+bacon_stacked = sum(timing_yes_growing_yes_bacon_clean$estimate * timing_yes_growing_yes_bacon_clean$weight)
+
+bacon_stacked
+```
+
+
+```{r}
+att_1930 = unlist(group_att[fake_year_treated == 1930, .(mean)])
+att_1940 = unlist(group_att[fake_year_treated == 1940, .(mean)])
+att_1945 = unlist(group_att[fake_year_treated == 1945, .(mean)])
+```
+Plot the decomposition
+```{r}
+timing_yes_growing_yes_bacon_plot = ggplot(timing_yes_growing_yes_bacon) +
+      geom_hline(yintercept = att_1930, linetype = "dashed") +
+    geom_hline(yintercept = att_1940, linetype = "dashed") +
+    geom_hline(yintercept = att_1945, linetype = "dashed") +
+  aes(x = weight, y = estimate, shape = factor(type), label = label, color = factor(type)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0) + 
+  theme_minimal(base_size = 18) +
+        geom_point(x = .2, y = att_1940, alpha = 0, size = 3) +
+    geom_point(x = .2, y = -30, size = 3, alpha = 0) +
+    geom_point(x = .2, y = -25, size = 3, alpha = 0) +
+    annotate("text", label = "Avg 1930 treatment", x = .2, y = att_1930*.95, size = 4)   +
+    annotate("text", label = "Avg 1940 treatment", x = .2, y = -32, size = 4)    +
+    annotate("text", label = "Avg 1945 treatment", x = .2, y = -11, size = 4)    +
+          geom_label_repel(force = 10, max.time = 10, show.legend = FALSE, seed = 1234) +
+  labs(x = "Weight", y = "Estimate", shape = "Type", color = "Type", title = "Bacon decomposition") +
+     guides(col = guide_legend(ncol = 3)) +
+    theme(legend.position="bottom", 
+          legend.title = element_blank())
+
+
+ 
+  
+
+timing_yes_growing_yes_bacon_plot
+```
+
+
+```{r, echo = FALSE}
+ggsave(plot = timing_yes_growing_yes_bacon_plot, 
+       filename = "output/bacon-decomposition.pdf", 
+      height = 6,
+      width = 9,
+      units = "in")
+```
+
 
 ## Plot the three ATT comparisons next to one another. 
 
@@ -336,24 +410,12 @@ summary(timing_yes_growing_yes_cs)
     storage_temp = rbind(storage_temp, temp, 
                                            use.names = FALSE)
     
-    # Add SA results to storage dataset
-    temp = as.data.table(
-            cbind(
-                2, 
-                sa_output$coeftable[,1], 
-                sa_output$coeftable[,2], 
-                "Sun & Abraham (2020)"
-                )
-            )
-    storage_temp = rbind(storage_temp, temp, 
-                                           use.names = FALSE)
-    
       
 
     # Add CS results to storage dataset
     temp = as.data.table(
             cbind(
-                3, 
+                2, 
                 timing_yes_growing_yes_cs$overall.att, 
                 timing_yes_growing_yes_cs$overall.se, 
                 "Callaway Sant'Anna"
@@ -365,7 +427,7 @@ summary(timing_yes_growing_yes_cs)
     # Add Stacked results to storage dataset
     temp = as.data.table(
             cbind(
-                4, 
+                3, 
                 timing_yes_growing_yes_stacked_att$b[1], 
                 timing_yes_growing_yes_stacked_att$se[1], 
                 "Stacked"
@@ -385,6 +447,8 @@ Plot the ATTs next to one another.
 ```{r, plot-att}
     # Add truth 
     true_avg_att = annual_avg_treatment_effect[event_time > 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect, w = weight_for_total))]
+    true_avg_att = annual_avg_treatment_effect[event_time > 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect))]
+
     true_avg_att = mean(true_avg_att$avg_true_treatment_effect)
 timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data, 
        aes(x = factor(order), 
@@ -393,89 +457,28 @@ timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data,
            ymax = b + 1.96*se,
            shape = Method, 
            color = Method)) + 
-    geom_point(size=3) +
-    geom_errorbar(width=0.05) +
+    geom_point(size=6) +
+    geom_errorbar(width=0.1) +
     theme_minimal() +
     geom_hline(yintercept = 0) +
     geom_hline(yintercept = true_avg_att, linetype = "dashed") +
-    annotate("text", label = "True ATT", x = 4.4, y = true_avg_att*.95, size = 4)   +
+    geom_hline(yintercept = bacon_stacked, linetype = "dashed") +
+    annotate("text", label = "Average real treatment", x = 3, y = true_avg_att*.95, size = 4)   +
+    annotate("text", label = "Clean controls, weighted", x = 1.15, y = bacon_stacked*.9, size = 4)   +
+    annotate("text", label = "average real treatment", x = 1.15, y = bacon_stacked*1.1, size = 4)   +
     labs(title = "ATT estimates by method", 
          y = "", 
          subtitle = "Change in influenza/pneumonia mortality death rate per 100,000", 
          x = "")  + 
-    scale_x_discrete(breaks=c("1","2","3", "4"),
-        labels=c("TWFE", "Sun & Abraham (2020)", "Callaway Sant'Anna", "Stacked")) +
-    theme_classic(base_size = 18) +
+    scale_x_discrete(breaks=c("1","2","3"),
+        labels=c("TWFE", "Callaway Sant'Anna", "Stacked")) +
+    theme_classic(base_size = 20) +
 theme(legend.position = "none")
 timing_yes_growing_yes_att_plot
 ```
 ```{r, save-fake-att-comparison, echo = FALSE}
 ggsave(plot = timing_yes_growing_yes_att_plot, 
        filename = "output/fake-data-att-comparison.pdf", 
-      height = 6,
-      width = 9,
-      units = "in")
-```
-
-### Bacon-decomposition to confirm ATT from TWFE
-
-```{r}
-timing_yes_growing_yes_bacon = bacon(fake_value ~ treated,
-                  data = as.data.frame(timing_yes_growing_yes),
-                  id_var = "state_pc",
-                  time_var = "year")
-timing_yes_growing_yes_bacon = as.data.table(timing_yes_growing_yes_bacon)
-timing_yes_growing_yes_bacon[, untreated := ifelse(untreated == 99999, "Never", untreated)]
-
-timing_yes_growing_yes_bacon[, label := do.call(paste, c(.SD, sep = " vs. ")), .SDcols = c("treated", "untreated")]
-
-# Show bacon decomp 
-timing_yes_growing_yes_bacon
-
-# Now compare this to the group-specific real ATT
-group_att
-
-# weighted average of the decomposition, this should be the same as TWFE DiD
-sum(timing_yes_growing_yes_bacon$estimate * timing_yes_growing_yes_bacon$weight)
-```
-```{r}
-att_1930 = unlist(group_att[fake_year_treated == 1930, .(mean)])
-att_1940 = unlist(group_att[fake_year_treated == 1940, .(mean)])
-att_1945 = unlist(group_att[fake_year_treated == 1945, .(mean)])
-```
-Plot the decomposition
-```{r}
-timing_yes_growing_yes_bacon_plot = ggplot(timing_yes_growing_yes_bacon) +
-      geom_hline(yintercept = att_1930, linetype = "dashed") +
-    geom_hline(yintercept = att_1940, linetype = "dashed") +
-    geom_hline(yintercept = att_1945, linetype = "dashed") +
-  aes(x = weight, y = estimate, shape = factor(type), label = label, color = factor(type)) +
-  geom_point(size = 3) +
-  geom_hline(yintercept = 0) + 
-  theme_minimal(base_size = 18) +
-        geom_point(x = .2, y = att_1940, alpha = 0, size = 3) +
-    geom_point(x = .2, y = -30, size = 3, alpha = 0) +
-    geom_point(x = .2, y = -25, size = 3, alpha = 0) +
-    annotate("text", label = "True 1930", x = .2, y = att_1930*.95, size = 4)   +
-    annotate("text", label = "True 1940", x = .205, y = -32, size = 4)    +
-    annotate("text", label = "True 1945", x = .205, y = -11, size = 4)    +
-          geom_label_repel(force = 10, max.time = 10, show.legend = FALSE, seed = 1234) +
-  labs(x = "Weight", y = "Estimate", shape = "Type", color = "Type", title = "Bacon decomposition") +
-     guides(col = guide_legend(ncol = 3)) +
-    theme(legend.position="bottom", 
-          legend.title = element_blank())
-
-
- 
-  
-
-timing_yes_growing_yes_bacon_plot
-```
-
-
-```{r, echo = FALSE}
-ggsave(plot = timing_yes_growing_yes_bacon_plot, 
-       filename = "output/bacon-decomposition.pdf", 
       height = 6,
       width = 9,
       units = "in")
@@ -518,28 +521,28 @@ es_plot = function(dt, id_var, time_var, year_treated_var, value_var, untreated_
                                            use.names = FALSE)
     
   # Run Sun and Abraham
-  formula_sa = as.formula(paste0(value_var, " ~ sunab(" , year_treated_var, ", ", time_var, ")",
-                               " | ", id_var, " + ", time_var))
-  
-  sa_temp = fixest::feols(formula_sa, data = dt_temp)
-    
-  # Extract coefs
-  coef_sa_temp = sa_temp$coeftable
-  
+  # formula_sa = as.formula(paste0(value_var, " ~ sunab(" , year_treated_var, ", ", time_var, ")",
+  #                              " | ", id_var, " + ", time_var))
+  # 
+  # sa_temp = fixest::feols(formula_sa, data = dt_temp)
+  #   
+  # # Extract coefs
+  # coef_sa_temp = sa_temp$coeftable
+  # 
   # Add results to storage dataset
-  temp = as.data.table(
-            cbind(
-                sa_temp$model_matrix_info[[1]]$items, 
-                append(coef_sa_temp[,1], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
-                append(coef_sa_temp[,2], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
-                rep("Sun & Abraham (2020)",
-                    each=length(sa_temp$model_matrix_info[[1]]$items))
-                )
-            )
-    storage_temp = rbind(storage_temp, temp, 
-                                       use.names = FALSE)
-
-    # Callaway Sant'Anna
+  # temp = as.data.table(
+  #           cbind(
+  #               sa_temp$model_matrix_info[[1]]$items, 
+  #               append(coef_sa_temp[,1], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
+  #               append(coef_sa_temp[,2], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
+  #               rep("Sun & Abraham (2020)",
+  #                   each=length(sa_temp$model_matrix_info[[1]]$items))
+  #               )
+  #           )
+  #   storage_temp = rbind(storage_temp, temp, 
+  #                                      use.names = FALSE)
+  # 
+  # Callaway Sant'Anna
     
     # Turn id var into numeric
     dt_temp[,state_group := as.numeric(as.factor(get(id_var)))]
@@ -592,7 +595,7 @@ es_plot = function(dt, id_var, time_var, year_treated_var, value_var, untreated_
                truth_to_add$event_time, 
                 truth_to_add$avg_true_treatment_effect, 
                 truth_to_add$se, 
-                rep("True avg effect", each=length(es$egt))
+                rep("Average real effect", each=length(es$egt))
                 )
             )
     
@@ -610,7 +613,7 @@ es_plot = function(dt, id_var, time_var, year_treated_var, value_var, untreated_
 }
 ```
 
-Run TWFE, Sun Abraham, and CS event-studies, storing coefs and se. 
+Run TWFE, and CS event-studies, storing coefs and se. 
 
 ```{r, run-es-code}
 timing_yes_growing_yes_es_data = es_plot(
