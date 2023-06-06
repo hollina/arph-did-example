@@ -65,10 +65,9 @@ ggsave(plot = flu_plot,
       units = "in")
 ```
 
-
 ## Simple DiD
 
-Compare changes in influenza death rates, before and after the invention of sulfa-drugs, to changes in tuberculosis death rates. Original AEJ paper discusses how TB was less affected. 
+Compare changes in influenza death rates, before and after the invention of sulfa-drugs, to changes in tuberculosis death rates. Original AEJ paper discusses how TB was less affected.
 
 ### Time-series comparison
 
@@ -97,7 +96,7 @@ ggplot(data = subset(national_mortality, year >= 1928), aes(x = year, y = (influ
 
 ### DiD comparison
 
-To make this comparison, I will first work with the state-level data. We will reshape the data, call treatment 1937 and after, create post $\times$ treat variable. 
+To make this comparison, I will first work with the state-level data. We will reshape the data, call treatment 1937 and after, create post $\times$ treat variable.
 
 ```{r, reshape-state-data, echo = FALSE}
 
@@ -122,9 +121,7 @@ etable(simple_did)
 effect = simple_did$coeftable[1,1]
 ```
 
-
-There is a `r round(effect, 1)` change in the influenza and pneumonia mortality rate per 100,000, relative to the change in tuberculosis mortality, following the advent of sulfa-drugs. 
-
+There is a `r round(effect, 1)` change in the influenza and pneumonia mortality rate per 100,000, relative to the change in tuberculosis mortality, following the advent of sulfa-drugs.
 
 # Example using fake data
 
@@ -199,7 +196,9 @@ timing_yes_growing_yes_collapsed = collap(timing_yes_growing_yes, ~ year + fake_
 
 
 ```
+
 Determine true treatment effect, ATT by group, and avg-ATT by treated year
+
 ```{r}
 # Now figure out 
     # the average treatment effect for each group
@@ -219,7 +218,6 @@ group_true_treatment_effect = timing_yes_growing_yes[, list(mean = fmean(true_tr
 
 group_att = group_true_treatment_effect[treated == 1]
 ```
-
 
 Plot data
 
@@ -254,10 +252,10 @@ ggsave(plot = timing_yes_growing_yes_plot,
       units = "in")
 ```
 
-
 ## Estimate ATT
 
 ### Two way fixed-effects
+
 ```{r}
 timing_yes_growing_yes_twfe = fixest::feols(fake_value ~ treated | state_pc + year, data = timing_yes_growing_yes)
 
@@ -268,16 +266,18 @@ timing_yes_growing_yes_twfe
 
 ### Stacked
 
-Not sure of R command for this. So I am exporting to stata. 
+Not sure of R command for this. So I am exporting to stata.
+
 ```{r}
 fwrite(timing_yes_growing_yes, 
        file = "timing_yes_growing_yes.csv")
 ```
 
 Read in ATT and Event study
+
 ```{r}
-timing_yes_growing_yes_stacked_att = fread("timing_yes_growing_yes_stacked_att.csv")
-timing_yes_growing_yes_stacked_es = fread("timing_yes_growing_yes_stacked_es.csv")
+timing_yes_growing_yes_stacked_att = fread("stata/timing_yes_growing_yes_stacked_att.csv")
+timing_yes_growing_yes_stacked_es = fread("stata/timing_yes_growing_yes_stacked_es.csv")
 ```
 
 ### Callaway Sant'Anna
@@ -345,13 +345,14 @@ bacon_stacked = sum(timing_yes_growing_yes_bacon_clean$estimate * timing_yes_gro
 bacon_stacked
 ```
 
-
 ```{r}
 att_1930 = unlist(group_att[fake_year_treated == 1930, .(mean)])
 att_1940 = unlist(group_att[fake_year_treated == 1940, .(mean)])
 att_1945 = unlist(group_att[fake_year_treated == 1945, .(mean)])
 ```
+
 Plot the decomposition
+
 ```{r}
 timing_yes_growing_yes_bacon_plot = ggplot(timing_yes_growing_yes_bacon) +
       geom_hline(yintercept = att_1930, linetype = "dashed") +
@@ -380,7 +381,6 @@ timing_yes_growing_yes_bacon_plot = ggplot(timing_yes_growing_yes_bacon) +
 timing_yes_growing_yes_bacon_plot
 ```
 
-
 ```{r, echo = FALSE}
 ggsave(plot = timing_yes_growing_yes_bacon_plot, 
        filename = "output/bacon-decomposition.pdf", 
@@ -389,8 +389,7 @@ ggsave(plot = timing_yes_growing_yes_bacon_plot,
       units = "in")
 ```
 
-
-## Plot the three ATT comparisons next to one another. 
+## Plot the three ATT comparisons next to one another.
 
 ```{r}
 
@@ -443,11 +442,12 @@ ggsave(plot = timing_yes_growing_yes_bacon_plot,
 
 ```
 
-Plot the ATTs next to one another. 
+Plot the ATTs next to one another.
+
 ```{r, plot-att}
     # Add truth 
-    true_avg_att = annual_avg_treatment_effect[event_time > 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect, w = weight_for_total))]
-    true_avg_att = annual_avg_treatment_effect[event_time > 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect))]
+    true_avg_att = annual_avg_treatment_effect[event_time >= 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect, w = weight_for_total))]
+    true_avg_att = annual_avg_treatment_effect[event_time >= 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect))]
 
     true_avg_att = mean(true_avg_att$avg_true_treatment_effect)
 timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data, 
@@ -476,6 +476,7 @@ timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data,
 theme(legend.position = "none")
 timing_yes_growing_yes_att_plot
 ```
+
 ```{r, save-fake-att-comparison, echo = FALSE}
 ggsave(plot = timing_yes_growing_yes_att_plot, 
        filename = "output/fake-data-att-comparison.pdf", 
@@ -613,7 +614,7 @@ es_plot = function(dt, id_var, time_var, year_treated_var, value_var, untreated_
 }
 ```
 
-Run TWFE, and CS event-studies, storing coefs and se. 
+Run TWFE, and CS event-studies, storing coefs and se.
 
 ```{r, run-es-code}
 timing_yes_growing_yes_es_data = es_plot(
@@ -627,7 +628,8 @@ timing_yes_growing_yes_es_data = es_plot(
 )
 ```
 
-Plot the event-studies on top of one another. 
+Plot the event-studies on top of one another.
+
 ```{r, plot-es}
 timing_yes_growing_yes_es_plot = ggplot(data = timing_yes_growing_yes_es_data, 
        aes(x = event_time, 
@@ -657,7 +659,7 @@ ggsave(plot = timing_yes_growing_yes_es_plot,
       units = "in")
 ```
 
-Zoom into -8 to +8, where the majority of treated years are, to see how TWFE is different that other two methods. 
+Zoom into -8 to +8, where the majority of treated years are, to see how TWFE is different that other two methods.
 
 ```{r, plot-es-zoom}
 timing_yes_growing_yes_es_zoom_plot = timing_yes_growing_yes_es_plot + 
@@ -668,7 +670,6 @@ timing_yes_growing_yes_es_zoom_plot = timing_yes_growing_yes_es_plot +
 timing_yes_growing_yes_es_zoom_plot
 ```
 
-
 ```{r}
 ggsave(plot = timing_yes_growing_yes_es_zoom_plot, 
        filename = "output/timing_yes_growing_yes_es_zoom_plot.pdf", 
@@ -676,5 +677,3 @@ ggsave(plot = timing_yes_growing_yes_es_zoom_plot,
       width = 9,
       units = "in")
 ```
-
-
