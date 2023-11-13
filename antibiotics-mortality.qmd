@@ -252,35 +252,501 @@ ggsave(plot = timing_yes_growing_yes_plot,
       units = "in")
 ```
 
-## Estimate ATT
+# Treatment effect estimates by method
 
-### Two way fixed-effects
+## Two-way fixed-effects
+
+### ATT
 
 ```{r}
 timing_yes_growing_yes_twfe = fixest::feols(fake_value ~ treated | state_pc + year, data = timing_yes_growing_yes)
 
 # Estimate of the treatment effect is 
 timing_yes_growing_yes_twfe$coeftable[1,1]
-timing_yes_growing_yes_twfe
+
+timing_yes_growing_yes_twfe_att = data.table(order = 1, 
+                                        b = timing_yes_growing_yes_twfe$coeftable[1], 
+                                        se = timing_yes_growing_yes_twfe$coeftable[2], 
+                                        method = "TWFE")
 ```
 
-### Stacked
-
-Not sure of R command for this. So I am exporting to stata.
+### Event-study 
 
 ```{r}
-fwrite(timing_yes_growing_yes, 
-       file = "timing_yes_growing_yes.csv")
+timing_yes_growing_yes_es_data = copy(timing_yes_growing_yes)
+timing_yes_growing_yes_es_data[,fake_year_treated := ifelse(fake_year_treated == 2020, NA, fake_year_treated)]
+timing_yes_growing_yes_es_data[,event_time := year - fake_year_treated]
+timing_yes_growing_yes_es_data[,event_time_no_na := ifelse(is.na(event_time), -1, event_time)]
+timing_yes_growing_yes_es_data[,ever_treated := ifelse(is.na(fake_year_treated), 0, 1)]
+
+
+twfe_es = feols(fake_value ~ i(event_time_no_na, ever_treated, ref = -1) | state_pc + year, 
+                              data = timing_yes_growing_yes_es_data, 
+                           cluster = timing_yes_growing_yes_es_data$state_pc)
+
+rm(timing_yes_growing_yes_es_data)
+
+position_of_neg_1 = which(twfe_es$model_matrix_info[[1]]$items == -1)
+  
+    timing_yes_growing_yes_twfe_es = as.data.table(
+            cbind(
+                twfe_es$model_matrix_info[[1]]$items, 
+                append(twfe_es$coefficients, 0, position_of_neg_1-1), 
+                append(twfe_es$se, 0, position_of_neg_1-1), 
+                rep("TWFE",each=length(twfe_es$model_matrix_info[[1]]$items))
+                )
+            )
+    
+    colnames(timing_yes_growing_yes_twfe_es) = c("event_time", "b", "se", "type")
 ```
 
-Read in ATT and Event study
+## Unbalanced-stacked
+
+#### Functions for stacked balanced and stacked unbalanced. 
 
 ```{r}
-timing_yes_growing_yes_stacked_att = fread("stata/timing_yes_growing_yes_stacked_att.csv")
-timing_yes_growing_yes_stacked_es = fread("stata/timing_yes_growing_yes_stacked_es.csv")
+
+createBalancedStackedData = function(dataset, outcome, condition = NULL, timeTreated, timeID, groupID, k_pre, k_post, year_start_stack, year_end_stack, NotYetTreated = FALSE){
+    
+    dt_temp = copy(dataset)
+    
+    # If no restriction
+    if (is.null(condition)) {
+        print("Dataset returned without restriction")
+    }
+    
+    # If restriction 
+    if (!is.null(condition)){
+        # Convert condition from character to expression
+        condition_expr = parse(text = condition)
+        
+        # Implement restriction
+        dt_temp = dt_temp[eval(condition_expr)]
+        
+        print("Dataset returned with restriction")
+    }
+    
+    # Remove rows that are NA for outcome
+    outcome_fixed  = deparse(substitute(outcome))
+    
+    dt_temp = na.omit(dt_temp, cols = c(outcome_fixed))
+    
+    
+    # Make a copy of the datasets so we don't cause issues
+    dt_stack = copy(dt_temp)
+    
+    # Ensure it's a data.table object
+    dt_stack = as.data.table(dt_stack)
+    
+    # Ever treated
+    dt_stack[, temp_ever_treated := ifelse(!is.na(get(timeTreated)), 1, 0)]
+    dt_stack[, event_time := get(timeID) - get(timeTreated)]
+
+    # Step 1: Define an event window
+    # This is done using k_pre, k_post, year_start_stack, and year_end_stack above
+    # k_pre = -6
+    # k_post = 6
+    # year_start_stack = 1922
+    # year_end_stack = 1942
+    # get(groupID)
+    
+    # Step 2. Enumerate Sub-Experiments
+    unique_sub_experiments = unique(dt_stack[!is.na(get(timeTreated)), .(get(timeTreated))])
+    
+    # For some reason the first column doesnt keep the name of the variable. Rename it
+    setnames(unique_sub_experiments, "V1", eval(timeTreated))
+    
+    # Now for each sub-experiment, find the years we want to keep for the never-treated and not yet treated. 
+    sub_experiments_to_keep = unique_sub_experiments[get(timeTreated) >= year_start_stack - k_pre & get(timeTreated) <= year_end_stack - k_post]
+    sub_experiments_to_keep[, max_year := get(timeTreated) + k_post]
+    sub_experiments_to_keep[, min_year := get(timeTreated) + k_pre]
+    
+    # Step 3. Define Inclusion Criteria
+    # Create a storage data.table 
+    temp_stack_storage = dt_stack
+    temp_stack_storage[,stackID := 0]
+    temp_stack_storage[,count := 0]
+    temp_stack_storage[,treated_in_stack := 0]
+    temp_stack_storage = temp_stack_storage[0,]
+    
+    for (i in 1:nrow(sub_experiments_to_keep)) {
+        #i = 1
+        stackYear = unlist(sub_experiments_to_keep[i,1])
+        # First, find never treated control set within the window
+        temp_dt_stack_nevertreat = dt_stack[temp_ever_treated == 0 & get(timeID) >= sub_experiments_to_keep$min_year[i] & get(timeID) <= sub_experiments_to_keep$max_year[i]]
+        
+        # Keep only groups present in each year 
+        temp_dt_stack_nevertreat[, count := .N, by = get(groupID)]
+        temp_dt_stack_nevertreat = temp_dt_stack_nevertreat[count == k_post - k_pre + 1]
+        
+        # Add stack-id
+        temp_dt_stack_nevertreat[,stackID := stackYear]
+        temp_dt_stack_nevertreat[,treated_in_stack := 0]
+        
+        # Second, find the treated set for this sub-experiment. Being sure to remove years outside of the window
+        # Keep ever_treated, and treated in this sub experiment
+        sub_experiments_to_keep
+        temp_dt_stack_treat = dt_stack[temp_ever_treated == 1 & get(timeTreated) == stackYear]
+        
+        # keep only years within window
+        temp_dt_stack_treat = temp_dt_stack_treat[get(timeID) >= sub_experiments_to_keep$min_year[i] & get(timeID) <= sub_experiments_to_keep$max_year[i]]
+        
+        # Keep only groups present in each year 
+        temp_dt_stack_treat[, count := .N, by = get(groupID)]
+        temp_dt_stack_treat = temp_dt_stack_treat[count == k_post - k_pre + 1]
+        
+        # Add stack-id
+        temp_dt_stack_treat[,stackID := stackYear]      
+        temp_dt_stack_treat[,treated_in_stack := 1]
+        
+        # Step 4. Stack The Data
+        temp_stack_storage = rbind(temp_stack_storage, 
+                                   temp_dt_stack_nevertreat, 
+                                   temp_dt_stack_treat)
+        
+        # Back to Step3, but for the not yet treated set for this sub-experiment.  
+        if (NotYetTreated == TRUE) {
+            # Keep ever_treated, but not treated in this sub experiment
+            temp_dt_stack_notyettreat = dt_stack[temp_ever_treated == 1 & get(timeTreated) != stackYear]
+            # keep only years within window
+            temp_dt_stack_notyettreat = temp_dt_stack_notyettreat[get(timeID) >= sub_experiments_to_keep$min_year[i] & get(timeID) <= sub_experiments_to_keep$max_year[i]]
+            # Keep only those not yet treated observations that are outside of the window we are looking in 
+            temp_dt_stack_notyettreat = temp_dt_stack_notyettreat[event_time < k_pre]
+            
+            # Keep only groups present in each year 
+            temp_dt_stack_notyettreat[, count := .N, by = list(get(groupID))]
+            temp_dt_stack_notyettreat = temp_dt_stack_notyettreat[count == k_post - k_pre + 1]
+            
+            # Add stack-id
+            temp_dt_stack_notyettreat[,stackID := stackYear]
+            temp_dt_stack_notyettreat[,treated_in_stack := 0]
+            
+            # Step 4. Stack The Data
+            temp_stack_storage = rbind(temp_stack_storage,  
+                                       temp_dt_stack_notyettreat)
+        }
+        
+    }
+    # -----------------------------------------------------
+    # Compute Weights 
+    # -----------------------------------------------------
+    
+    # Add an event time for all units
+    temp_stack_storage[, all_event_time := get(timeID) - stackID]
+    
+    # Stack-time-level counts
+    temp_stack_storage[, `:=` (stack_n = .N, stack_treat_n = sum(treated_in_stack),
+                                   stack_control_n = sum(1 - treated_in_stack)), 
+                           by = all_event_time] 
+    
+    # sub_exp-level counts
+    temp_stack_storage[, `:=` (sub_n = .N, sub_treat_n = sum(treated_in_stack), 
+                                   sub_control_n = sum(1 - treated_in_stack)), 
+                           by = c("stackID", "all_event_time")] 
+    
+    # sub-experiment shares of total by period
+    temp_stack_storage[, sub_share := sub_n / stack_n] 
+    
+    # Shares of treated and control groups within each sub experiment
+    temp_stack_storage[, `:=` (sub_treat_share = sub_treat_n / stack_treat_n, 
+                                   sub_control_share = sub_control_n / stack_control_n)]   
+    
+    
+    # Compute weights
+    temp_stack_storage[treated_in_stack == 1, cweight := 1]
+    temp_stack_storage[treated_in_stack == 0, cweight := sub_treat_share/sub_control_share] 
+    
+    # Remove temp_ever_treated and event_time to avoid any confusion later 
+    temp_stack_storage = temp_stack_storage[,-c("event_time", "temp_ever_treated")]
+    
+    return(temp_stack_storage)
+}
 ```
 
-### Callaway Sant'Anna
+```{r}
+## Using unbalanced sample. Add this note to stacked. and CS figure. 
+createUnbalancedStackedData = function(dataset,  timeTreated, timeID, NotYetTreated = FALSE){
+    #dataset = fake_mortality_data
+    #timeTreated = time_treated
+    
+    dt_temp = copy(dataset)
+    
+    
+    # Make a copy of the datasets so we don't cause issues
+    dt_stack = copy(dt_temp)
+    
+    # Ensure it's a data.table object
+    dt_stack = as.data.table(dt_stack)
+    
+    # Ever treated
+    dt_stack[, temp_ever_treated := ifelse(!is.na(get(timeTreated)), 1, 0)]
+    dt_stack[, event_time := get(timeID) - get(timeTreated)]
+
+    # Step 1: Define an event window
+    # This is done using k_pre, k_post, year_start_stack, and year_end_stack above
+    # year_start_stack = 1922
+    # year_end_stack = 1942
+    # get(groupID)
+    
+    # Step 2. Enumerate Sub-Experiments
+    unique_sub_experiments = unique(dt_stack[!is.na(get(timeTreated)), .(get(timeTreated))])
+    
+    # For some reason the first column doesnt keep the name of the variable. Rename it
+    setnames(unique_sub_experiments, "V1", eval(timeTreated))
+    
+    # Now for each sub-experiment, find the years we want to keep for the never-treated and not yet treated. 
+    
+    # Step 3. Define Inclusion Criteria
+    # Create a storage data.table 
+    temp_stack_storage = dt_stack
+    temp_stack_storage[,stackID := 0]
+    temp_stack_storage[,count := 0]
+    temp_stack_storage[,treated_in_stack := 0]
+    temp_stack_storage = temp_stack_storage[0,]
+    
+    for (i in 1:nrow(unique_sub_experiments)) {
+        # i = 1
+        stackYear = unlist(unique_sub_experiments[i,1])
+        # First, find never treated control set within the window
+        temp_dt_stack_nevertreat = dt_stack[temp_ever_treated == 0]
+        
+        
+        # Add stack-id
+        temp_dt_stack_nevertreat[,stackID := stackYear]
+        temp_dt_stack_nevertreat[,treated_in_stack := 0]
+        
+        # Second, find the treated set for this sub-experiment. Being sure to remove years outside of the window
+        # Keep ever_treated, and treated in this sub experiment
+        
+        temp_dt_stack_treat = dt_stack[temp_ever_treated == 1 & get(timeTreated) == stackYear]
+        
+        # keep only years within window
+        
+        # Add stack-id
+        temp_dt_stack_treat[,stackID := stackYear]      
+        temp_dt_stack_treat[,treated_in_stack := 1]
+        
+        # Step 4. Stack The Data
+        temp_stack_storage = rbind(temp_stack_storage, 
+                                   temp_dt_stack_nevertreat, 
+                                   temp_dt_stack_treat)
+        
+        # Back to Step3, but for the not yet treated set for this sub-experiment.  
+        if (NotYetTreated == TRUE) {
+            # Keep ever_treated, but not treated in this sub experiment
+            temp_dt_stack_notyettreat = dt_stack[temp_ever_treated == 1 & get(timeTreated) > stackYear]
+            # keep only years within window
+            temp_dt_stack_notyettreat = temp_dt_stack_notyettreat[get(timeID) <= get(timeTreated)]
+            # Keep only those not yet treated observations that are outside of the window we are looking in 
+            
+            # Add stack-id
+            temp_dt_stack_notyettreat[,stackID := stackYear]
+            temp_dt_stack_notyettreat[,treated_in_stack := 0]
+            
+            # Step 4. Stack The Data
+            temp_stack_storage = rbind(temp_stack_storage,  
+                                       temp_dt_stack_notyettreat)
+        }
+        
+    }
+    
+    # -----------------------------------------------------
+    # Compute Weights 
+    # -----------------------------------------------------
+    
+    # Add an event time for all units
+    temp_stack_storage[, all_event_time := get(timeID) - stackID]
+    
+    # Stack-time-level counts
+    temp_stack_storage[, `:=` (stack_n = .N, stack_treat_n = sum(treated_in_stack),
+                               stack_control_n = sum(1 - treated_in_stack)), 
+                       by = all_event_time] 
+    
+    # sub_exp-level counts
+    temp_stack_storage[, `:=` (sub_n = .N, sub_treat_n = sum(treated_in_stack), 
+                               sub_control_n = sum(1 - treated_in_stack)), 
+                       by = c("stackID", "all_event_time")] 
+    
+    # sub-experiment shares of total by period
+    temp_stack_storage[, sub_share := sub_n / stack_n] 
+    
+    # Shares of treated and control groups within each sub experiment
+    temp_stack_storage[, `:=` (sub_treat_share = sub_treat_n / stack_treat_n, 
+                               sub_control_share = sub_control_n / stack_control_n)]   
+    
+    
+    # Compute weights
+    temp_stack_storage[treated_in_stack == 1, cweight := 1]
+    temp_stack_storage[treated_in_stack == 0, cweight := sub_treat_share/sub_control_share] 
+    
+    # Remove temp_ever_treated and event_time to avoid any confusion later 
+    temp_stack_storage = temp_stack_storage[,-c("event_time", "temp_ever_treated")]
+    
+    return(temp_stack_storage)
+}
+
+```
+
+
+```{r}
+timing_yes_growing_yes_with_na = timing_yes_growing_yes[, fake_year_treated := ifelse(fake_year_treated == 2020, NA, fake_year_treated)]
+```
+
+
+
+```{r}
+stacked_unbalanced = createUnbalancedStackedData(dataset = timing_yes_growing_yes_with_na, 
+                                      timeTreated = "fake_year_treated", 
+                                      timeID = "year",
+                                      NotYetTreated = FALSE)
+
+```
+
+
+### ATT
+
+```{r}
+stacked_feols_unbalanced = feols(fake_value ~ treated | state_pc^stackID + year^stackID + state_pc + year + stackID,
+                         data = stacked_unbalanced, 
+                           cluster = stacked_unbalanced$state_pc)
+
+timing_yes_growing_yes_stacked_att = data.table(order = 3, 
+                                        b = stacked_feols_unbalanced$coeftable[1], 
+                                        se = stacked_feols_unbalanced$coeftable[2], 
+                                        method = "Unbalanced-Stacked")
+```
+
+### Event-study
+
+```{r}
+stacked_es_unbalanced = feols(fake_value ~ i(all_event_time, treated_in_stack, ref = -1) | state_pc^stackID + year^stackID, 
+                              data = stacked_unbalanced, 
+                           cluster = stacked_unbalanced$state_pc)
+
+    timing_yes_growing_yes_stacked_es = as.data.table(
+            cbind(
+                stacked_es_unbalanced$model_matrix_info[[1]]$items, 
+                append(stacked_es_unbalanced$coefficients, 0, abs(min(stacked_es_unbalanced$model_matrix_info[[1]]$items))-1), 
+                append(stacked_es_unbalanced$se, 0, abs(min(stacked_es_unbalanced$model_matrix_info[[1]]$items))-1), 
+                rep("Stacked-Unbalanced",each=length(stacked_es_unbalanced$model_matrix_info[[1]]$items))
+                )
+            )
+    
+    colnames(timing_yes_growing_yes_stacked_es) = c("event_time", "b", "se", "type")
+```
+
+
+
+## Balanced-Stacked +/- 2: ATT
+
+```{r}
+ stacked_balanced_k_2 = createBalancedStackedData(dataset = timing_yes_growing_yes_with_na, 
+                                      outcome = fake_value,
+                                      condition = NULL, 
+                                      timeTreated = "fake_year_treated", 
+                                      timeID = "year",
+                                      groupID = "state_pc",
+                                      k_pre = -2,
+                                      k_post = 2, 
+                                      year_start_stack = 1928,
+                                      year_end_stack = 1950, 
+                                      NotYetTreated = TRUE)
+
+
+```
+
+###  Averge post-treatment effect
+```{r}
+stacked_balanced_k_2[,post_collapse_event_time := ifelse(all_event_time >= 0 , 1, all_event_time)]
+stacked_balanced_k_2_res = feols(fake_value ~ i(post_collapse_event_time, treated_in_stack, ref = -1) | treated_in_stack + post_collapse_event_time, 
+                              data = stacked_balanced_k_2, 
+                           cluster = stacked_balanced_k_2$state_pc, 
+                           weights = stacked_balanced_k_2$cweight)
+stacked_balanced_k_2_att = data.table(order = 4, 
+                                        b = stacked_balanced_k_2_res$coeftable[2], 
+                                        se = stacked_balanced_k_2_res$coeftable[4], 
+                                        method = "Balanced-Stacked -2:2")
+```
+
+### Event-study
+```{r}
+stacked_balanced_k_2_es = feols(fake_value ~ i(all_event_time, treated_in_stack, ref = -1) |  treated_in_stack +as.factor(all_event_time), 
+                              data = stacked_balanced_k_2, 
+                           cluster = stacked_balanced_k_2$state_pc, 
+                           weights = stacked_balanced_k_2$cweight)
+
+  timing_yes_growing_yes_stacked_es_bal_2 = as.data.table(
+            cbind(
+                stacked_balanced_k_2_es$model_matrix_info[[1]]$items, 
+                append(stacked_balanced_k_2_es$coefficients, 0, abs(min(stacked_balanced_k_2_es$model_matrix_info[[1]]$items))-1), 
+                append(stacked_balanced_k_2_es$se, 0, abs(min(stacked_balanced_k_2_es$model_matrix_info[[1]]$items))-1), 
+                rep("Balanced-Stacked -2:2",each=length(stacked_balanced_k_2_es$model_matrix_info[[1]]$items))
+                )
+            )
+    
+    colnames(timing_yes_growing_yes_stacked_es_bal_2) = c("event_time", "b", "se", "type")
+
+```
+
+
+## Balanced-Stacked -2 to + 4: ATT
+
+```{r}
+ stacked_balanced_k_2_4 = createBalancedStackedData(dataset = timing_yes_growing_yes_with_na, 
+                                      outcome = fake_value,
+                                      condition = NULL, 
+                                      timeTreated = "fake_year_treated", 
+                                      timeID = "year",
+                                      groupID = "state_pc",
+                                      k_pre = -2,
+                                      k_post = 4, 
+                                      year_start_stack = 1928,
+                                      year_end_stack = 1950, 
+                                      NotYetTreated = TRUE)
+
+
+```
+
+###  Averge post-treatment effect
+```{r}
+stacked_balanced_k_2_4[,post_collapse_event_time := ifelse(all_event_time >= 0 , 1, all_event_time)]
+stacked_balanced_k_2_4_res = feols(fake_value ~ i(post_collapse_event_time, treated_in_stack, ref = -1) | treated_in_stack + post_collapse_event_time, 
+                              data = stacked_balanced_k_2_4, 
+                           cluster = stacked_balanced_k_2_4$state_pc, 
+                           weights = stacked_balanced_k_2_4$cweight)
+stacked_balanced_k_2_4_res
+stacked_balanced_k_2_4_att = data.table(order = 5, 
+                                        b = stacked_balanced_k_2_4_res$coeftable[2], 
+                                        se = stacked_balanced_k_2_4_res$coeftable[4], 
+                                        method = "Balanced-Stacked -2:4")
+
+```
+
+
+### Event-study
+```{r}
+stacked_balanced_k_2_4_es = feols(fake_value ~ i(all_event_time, treated_in_stack, ref = -1) |  treated_in_stack +as.factor(all_event_time), 
+                              data = stacked_balanced_k_2_4, 
+                           cluster = stacked_balanced_k_2_4$state_pc, 
+                           weights = stacked_balanced_k_2_4$cweight)
+
+
+  timing_yes_growing_yes_stacked_es_bal_2_4 = as.data.table(
+            cbind(
+                stacked_balanced_k_2_4_es$model_matrix_info[[1]]$items, 
+                append(stacked_balanced_k_2_4_es$coefficients, 0, abs(min(stacked_balanced_k_2_4_es$model_matrix_info[[1]]$items))-1), 
+                append(stacked_balanced_k_2_4_es$se, 0, abs(min(stacked_balanced_k_2_4_es$model_matrix_info[[1]]$items))-1), 
+                rep("Balanced-Stacked -2:4",each=length(stacked_balanced_k_2_4_es$model_matrix_info[[1]]$items))
+                )
+            )
+    
+    colnames(timing_yes_growing_yes_stacked_es_bal_2_4) = c("event_time", "b", "se", "type")
+
+```
+
+## Callaway Sant'Anna
+
+### ATT
 
 ```{r}
 # Make a copy so we don't override. 
@@ -291,6 +757,7 @@ timing_yes_growing_yes_cs[,state_group := as.numeric(as.factor(state_pc))]
 
 # Never treated should be set to zero
 timing_yes_growing_yes_cs[,fake_year_treated := ifelse(fake_year_treated == 2020, 0, fake_year_treated)]
+timing_yes_growing_yes_cs[,fake_year_treated := ifelse(is.na(fake_year_treated), 0, fake_year_treated)]
 
 # Run CS
 timing_yes_growing_yes_attgt = att_gt(yname = "fake_value",
@@ -302,11 +769,43 @@ timing_yes_growing_yes_attgt = att_gt(yname = "fake_value",
                         )
 
 timing_yes_growing_yes_cs = aggte(timing_yes_growing_yes_attgt, type = "dynamic")
-summary(timing_yes_growing_yes_cs)
-
+timing_yes_growing_yes_cs$overall.att
 ```
 
-### Bacon-decomposition to compare ATT from TWFE and stacked
+
+```{r}
+   # Add CS results to dataset
+    timing_yes_growing_yes_cs_att = as.data.table(
+            cbind(
+                2, 
+                timing_yes_growing_yes_cs$overall.att, 
+                timing_yes_growing_yes_cs$overall.se, 
+                "Callaway Sant'Anna"
+                )
+            )
+```
+ 
+### Event-study 
+ 
+```{r}
+summary(timing_yes_growing_yes_cs)
+```
+Store this
+```{r}
+# Add to temp storage
+    timing_yes_growing_yes_cs_es = as.data.table(
+            cbind(
+               timing_yes_growing_yes_cs$egt, 
+                timing_yes_growing_yes_cs$att.egt, 
+                timing_yes_growing_yes_cs$se.egt, 
+                rep("Callaway Sant'Anna", each=length(timing_yes_growing_yes_cs$egt))
+                )
+            )
+    
+```
+
+
+# Bacon-decomposition to compare ATT from TWFE and unbalanced stacked
 
 ```{r}
 timing_yes_growing_yes_bacon = bacon(fake_value ~ treated,
@@ -389,50 +888,32 @@ ggsave(plot = timing_yes_growing_yes_bacon_plot,
       units = "in")
 ```
 
-## Plot the three ATT comparisons next to one another.
+# Plot the five treatment effect comparisons next to one another.
 
 ```{r}
 
 
  # Create storage dataset. 
-  storage_temp = data.table(order = numeric(), b=numeric(), se=numeric(), Method=character())
+  timing_yes_growing_yes_att_data = data.table(order = numeric(), b=numeric(), se=numeric(), Method=character())
   
   # Add TWFE results to storage dataset
-    temp = as.data.table(
-            cbind(
-                1, 
-                timing_yes_growing_yes_twfe$coeftable[1,1], 
-                timing_yes_growing_yes_twfe$coeftable[1,2], 
-                "TWFE"
-                )
-            )
-    storage_temp = rbind(storage_temp, temp, 
+    timing_yes_growing_yes_att_data = rbind(timing_yes_growing_yes_att_data, timing_yes_growing_yes_twfe_att, 
                                            use.names = FALSE)
-    
-      
 
     # Add CS results to storage dataset
-    temp = as.data.table(
-            cbind(
-                2, 
-                timing_yes_growing_yes_cs$overall.att, 
-                timing_yes_growing_yes_cs$overall.se, 
-                "Callaway Sant'Anna"
-                )
-            )
-    storage_temp = rbind(storage_temp, temp, 
+    timing_yes_growing_yes_att_data = rbind(timing_yes_growing_yes_att_data, timing_yes_growing_yes_cs_att, 
                                            use.names = FALSE)
     
-    # Add Stacked results to storage dataset
-    temp = as.data.table(
-            cbind(
-                3, 
-                timing_yes_growing_yes_stacked_att$b[1], 
-                timing_yes_growing_yes_stacked_att$se[1], 
-                "Stacked"
-                )
-            )
-    timing_yes_growing_yes_att_data = rbind(storage_temp, temp, 
+    # Add Unbalanced-Stacked results to storage dataset
+    timing_yes_growing_yes_att_data = rbind(timing_yes_growing_yes_att_data, timing_yes_growing_yes_stacked_att, 
+                                           use.names = FALSE)
+    
+    # Add Balanced-Stacked -2:2 results to storage dataset
+    timing_yes_growing_yes_att_data = rbind(timing_yes_growing_yes_att_data, stacked_balanced_k_2_att, 
+                                           use.names = FALSE)
+    
+    # Add Balanced-Stacked -2:4 results to storage dataset
+    timing_yes_growing_yes_att_data = rbind(timing_yes_growing_yes_att_data, stacked_balanced_k_2_4_att, 
                                            use.names = FALSE)
 
     # Ensure storage is numeric where it should be
@@ -446,10 +927,16 @@ Plot the ATTs next to one another.
 
 ```{r, plot-att}
     # Add truth 
-    true_avg_att = annual_avg_treatment_effect[event_time >= 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect, w = weight_for_total))]
     true_avg_att = annual_avg_treatment_effect[event_time >= 0, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect))]
 
+    true_avg_att_2 = unlist(annual_avg_treatment_effect[event_time >= 0 & event_time <= 2, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect))])
+
+    true_avg_att_4 = unlist(annual_avg_treatment_effect[event_time >= 0 & event_time <= 4, list(avg_true_treatment_effect = fmean(avg_true_treatment_effect))])
+
     true_avg_att = mean(true_avg_att$avg_true_treatment_effect)
+```
+
+```{r}
 timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data, 
        aes(x = factor(order), 
            y = b, 
@@ -457,22 +944,33 @@ timing_yes_growing_yes_att_plot = ggplot(data = timing_yes_growing_yes_att_data,
            ymax = b + 1.96*se,
            shape = Method, 
            color = Method)) + 
-    geom_point(size=6) +
+    geom_point(size=4) +
     geom_errorbar(width=0.1) +
     theme_minimal() +
     geom_hline(yintercept = 0) +
+    geom_hline(yintercept = true_avg_att_2, linetype = "dashed") +
+    geom_hline(yintercept = true_avg_att_4, linetype = "dashed") +
     geom_hline(yintercept = true_avg_att, linetype = "dashed") +
     geom_hline(yintercept = bacon_stacked, linetype = "dashed") +
-    annotate("text", label = "Average real treatment", x = 3, y = true_avg_att*.95, size = 4)   +
-    annotate("text", label = "Clean controls, weighted", x = 1.15, y = bacon_stacked*.9, size = 4)   +
-    annotate("text", label = "average real treatment", x = 1.15, y = bacon_stacked*1.1, size = 4)   +
+    annotate("text", label = "balanced, 0 to 4", x = 2, y = true_avg_att_4*1.2, size = 4)   +
+    annotate("text", label = "Average treatment", x = 2, y = true_avg_att_4*.8, size = 4)   +
+
+    annotate("text", label = "Average treatment", x = 3, y = true_avg_att_2*.65, size = 4)   +
+    annotate("text", label = "balanced, 0 to 2", x = 3, y = true_avg_att_2*1.35, size = 4)   +
+    
+    annotate("text", label = "Average treatment", x = 3, y = true_avg_att*(1-.03), size = 4)   +
+    annotate("text", label = "unbalanced, whole post-period", x = 3, y = true_avg_att*1.03, size = 4)   +
+    
+    annotate("text", label = "Clean controls, weighted", x = 1.25, y = bacon_stacked*.925, size = 4)   +
+    annotate("text", label = "average treatment", x = 1.25, y = bacon_stacked*1.075, size = 4)   +
+    annotate("text", label = "unbalanced, whole post-period", x = 1.25, y = bacon_stacked*1.225, size = 4)   +
     labs(title = "ATT estimates by method", 
          y = "", 
          subtitle = "Change in influenza/pneumonia mortality death rate per 100,000", 
          x = "")  + 
-    scale_x_discrete(breaks=c("1","2","3"),
-        labels=c("TWFE", "Callaway Sant'Anna", "Stacked")) +
-    theme_classic(base_size = 20) +
+    scale_x_discrete(breaks=c("1","2","3", "4", "5"),
+        labels=c("TWFE", "Callaway Sant'Anna", "Unbalanced\nStacked", "Balanced\nStacked (-2:2)", "Balanced\nStacked (-2:4)")) +
+    theme_classic(base_size = 12) +
 theme(legend.position = "none")
 timing_yes_growing_yes_att_plot
 ```
@@ -485,148 +983,41 @@ ggsave(plot = timing_yes_growing_yes_att_plot,
       units = "in")
 ```
 
-## Event-study
+# Event-study comparison
 
 ```{r event-study-function, echo = FALSE, eval = TRUE}
 
-es_plot = function(dt, id_var, time_var, year_treated_var, value_var, untreated_value, ref_value = -1) {
-  # Create new temp data.table
-  dt_temp = copy(dt)
-  
-  # Add event-time
-  dt_temp[, event_time := get(time_var) - get(year_treated_var)]
-  dt_temp[, event_time := ifelse(get(year_treated_var) == untreated_value, ref_value,  event_time)]
-
-  # Add ever treated
-  dt_temp[, ever_treated := ifelse(get(year_treated_var) != untreated_value, 1,  0)]
-  
   # Create storage dataset. 
-  storage_temp = data.table(event_time = numeric(), b=numeric(), se=numeric(), Method=character())
-  
-  # Run TWFE
-  formula = as.formula(paste0(value_var, " ~ i(event_time, ever_treated, ref = ", ref_value, ")",
-                               " | ", id_var, " + ", time_var))
+  timing_yes_growing_yes_es_data = data.table(event_time = numeric(), b=numeric(), se=numeric(), Method=character())
 
-  did_temp = fixest::feols(formula, data = dt_temp)
-  
-  # Add results to storage dataset
-    temp = as.data.table(
-            cbind(
-                did_temp$model_matrix_info[[1]]$items, 
-                append(did_temp$coefficients, 0, abs(min(did_temp$model_matrix_info[[1]]$items))-1), 
-                append(did_temp$se, 0, abs(min(did_temp$model_matrix_info[[1]]$items))-1), 
-                rep("TWFE",each=length(did_temp$model_matrix_info[[1]]$items))
-                )
-            )
-    storage_temp = rbind(storage_temp, temp, 
-                                           use.names = FALSE)
-    
-  # Run Sun and Abraham
-  # formula_sa = as.formula(paste0(value_var, " ~ sunab(" , year_treated_var, ", ", time_var, ")",
-  #                              " | ", id_var, " + ", time_var))
-  # 
-  # sa_temp = fixest::feols(formula_sa, data = dt_temp)
-  #   
-  # # Extract coefs
-  # coef_sa_temp = sa_temp$coeftable
-  # 
-  # Add results to storage dataset
-  # temp = as.data.table(
-  #           cbind(
-  #               sa_temp$model_matrix_info[[1]]$items, 
-  #               append(coef_sa_temp[,1], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
-  #               append(coef_sa_temp[,2], 0, abs(min(sa_temp$model_matrix_info[[1]]$items))-1), 
-  #               rep("Sun & Abraham (2020)",
-  #                   each=length(sa_temp$model_matrix_info[[1]]$items))
-  #               )
-  #           )
-  #   storage_temp = rbind(storage_temp, temp, 
-  #                                      use.names = FALSE)
-  # 
-  # Callaway Sant'Anna
-    
-    # Turn id var into numeric
-    dt_temp[,state_group := as.numeric(as.factor(get(id_var)))]
-    
-    # Make sure that untreated year is set to zero
-    dt_temp[ ,year_treated_temp := ifelse(get(year_treated_var) == untreated_value, 0, get(year_treated_var))]
-    
- 
-    # Run CS
-    example_attgt = att_gt(yname = value_var,
-                        tname = time_var,
-                        idname = "state_group",
-                        gname = "year_treated_temp",
-                        xformla = ~1,
-                        data = dt_temp
-                        )
-    # Aggregate
-    es = aggte(example_attgt, type = "dynamic")
-
-    # Add to temp storage
-    temp = as.data.table(
-            cbind(
-               es$egt, 
-                es$att.egt, 
-                es$se.egt, 
-                rep("Callaway Sant'Anna", each=length(es$egt))
-                )
-            )
-    
-    storage_temp = rbind(storage_temp, temp, 
-                                       use.names = FALSE)
-    
-    # Add Stacked temp storage
-    temp = as.data.table(
-            cbind(
-               timing_yes_growing_yes_stacked_es$type, 
-                timing_yes_growing_yes_stacked_es$b, 
-                timing_yes_growing_yes_stacked_es$se, 
-                rep("Stacked", each=length(timing_yes_growing_yes_stacked_es$se))
-                )
-            )
-    
-    storage_temp = rbind(storage_temp, temp, 
-                                       use.names = FALSE)
-    
-    # Add truth 
-       truth_to_add =  annual_avg_treatment_effect[event_time > 0, se := 0]
-    temp = as.data.table(
-            cbind(
-               truth_to_add$event_time, 
-                truth_to_add$avg_true_treatment_effect, 
-                truth_to_add$se, 
-                rep("Average real effect", each=length(es$egt))
-                )
-            )
-    
-    storage_temp = rbind(storage_temp, temp, 
-                                       use.names = FALSE)
-    
+  # Add TWFE
+  timing_yes_growing_yes_es_data = rbind(timing_yes_growing_yes_es_data, 
+                                         timing_yes_growing_yes_twfe_es,
+                                         use.names = FALSE)
+  # Add CS
+  timing_yes_growing_yes_es_data = rbind(timing_yes_growing_yes_es_data, 
+                                         timing_yes_growing_yes_cs_es,
+                                         use.names = FALSE)
+  # Add Unbalanced stacked
+  timing_yes_growing_yes_es_data = rbind(timing_yes_growing_yes_es_data, 
+                                         timing_yes_growing_yes_stacked_es,
+                                         use.names = FALSE)
+  # Add Balanced stacked -2:2
+  timing_yes_growing_yes_es_data = rbind(timing_yes_growing_yes_es_data, 
+                                         timing_yes_growing_yes_stacked_es_bal_2,
+                                         use.names = FALSE)
+  # Add Balanced stacked -2:4
+  timing_yes_growing_yes_es_data = rbind(timing_yes_growing_yes_es_data, 
+                                         timing_yes_growing_yes_stacked_es_bal_2_4,
+                                         use.names = FALSE)
     
     # Ensure storage is numeric where it should be
-    storage_temp[, b := as.numeric(b)]
-    storage_temp[, se := as.numeric(se)]
-    storage_temp[, event_time := as.numeric(event_time)]
+    timing_yes_growing_yes_es_data[, b := as.numeric(b)]
+    timing_yes_growing_yes_es_data[, se := as.numeric(se)]
+    timing_yes_growing_yes_es_data[, event_time := as.numeric(event_time)]
     
-    # Return value
-    return(storage_temp)
-}
 ```
 
-Run TWFE, and CS event-studies, storing coefs and se.
-
-```{r, run-es-code}
-timing_yes_growing_yes_es_data = es_plot(
-    dt = timing_yes_growing_yes, 
-    id_var = "state_pc",
-    time_var = "year",
-    year_treated_var = "fake_year_treated",
-    value_var = "fake_value",
-    untreated_value = 2020,
-    ref_value = -1
-)
-```
 
 Plot the event-studies on top of one another.
 
